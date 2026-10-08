@@ -1,0 +1,23 @@
+# 敏感环境配置文件
+.env
+.env.*
+!.env.example
+
+# 本地数据库文件 (绝对不上传任何个人财务数据)
+*.db
+*.sqlite
+*.sqlite3
+budget_data.db
+
+# 日志与临时缓存
+*.log
+bot.log
+__pycache__/
+*.pyc
+.DS_Store
+scratch/
+
+# Python 虚拟环境
+venv/
+.venv/
+env/
