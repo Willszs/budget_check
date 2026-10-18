@@ -92,56 +92,7 @@ def parse_date_safely(d_str: str) -> date:
         return date.max
 
 def check_overload_alert(chat_id: int) -> str | None:
-    """
-    超载防护检测（扣除当前总资金）：
-    确保到每一个节点截止日，工作日所需日均工时都不超过 8 小时红线。
-    若超过 8 小时，触发弹窗警报并推荐周末分摊工时。
-    """
-    profile = db.get_profile(chat_id)
-    if not profile or profile["hourly_rate"] <= 0:
-        return None
-    balance = profile["current_balance"]
-    rate = profile["hourly_rate"]
-    milestones = db.get_milestones(chat_id, status="pending")
-    if not milestones:
-        return None
-    
-    milestones = sorted(milestones, key=lambda x: parse_date_safely(x['target_date']))
-    user_off_days = db.get_off_days(chat_id)
-    off_date_set = {od["off_date"] for od in user_off_days}
-    user_work_days = db.get_work_days(chat_id)
-    extra_work_set = {wd["work_date"] for wd in user_work_days}
-    today = get_today()
-
-    cumulative_money = 0.0
-    max_daily_h = 0.0
-    overload_title = None
-    weekend_relief_hours = 0.0
-
-    for m in milestones:
-        cumulative_money += m['target_money']
-        gap_money = max(0.0, cumulative_money - balance)
-        gap_hours = gap_money / rate
-        try:
-            target_dt = datetime.strptime(m['target_date'], "%Y-%m-%d").date()
-            if target_dt >= today:
-                workdays = calculate_workdays(today, target_dt, off_date_set, include_weekends=False, extra_work_dates=extra_work_set)
-                if workdays > 0:
-                    daily_h = gap_hours / workdays
-                    if round(daily_h, 1) > 8.0 and daily_h > max_daily_h:
-                        max_daily_h = daily_h
-                        overload_title = m['title']
-                        total_days_all = calculate_workdays(today, target_dt, off_date_set, include_weekends=True, extra_work_dates=extra_work_set)
-                        weekend_relief_hours = (gap_hours / total_days_all) if total_days_all > 0 else daily_h
-        except Exception:
-            pass
-
-    if overload_title and round(max_daily_h, 1) > 8.0:
-        return (
-            f"🚨 超载预警：【{overload_title}】截止日前工作日需每天 {max_daily_h:.1f}h(已超8小时上限)！\n"
-            f"💡 建议在日历中点击周末开启加班分摊，可降至 {weekend_relief_hours:.1f}h/天。"
-        )
-
+    """超载防护弹窗检测（已停用）"""
     return None
 
 
@@ -366,10 +317,7 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
             phase_start_dt = date_groups[bottleneck_d]["dt"]
             remaining_dates = remaining_dates[best_idx + 1:]
 
-        text += (
-            "─────────────────\n"
-            "🛡️ **【核心宗旨：节点100%全覆盖 · 严格控制工作区间 5.0h ~ 8.0h】**:\n"
-        )
+        text += "─────────────────\n"
 
         p1 = phases[0] if phases else None
         p1_b_date = p1["bottleneck"] if p1 else ""
@@ -381,38 +329,15 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
         p1_net_gap_h = (p1_net_gap_m / rate) if rate > 0 else 0.0
 
         p1_raw_pace = p1["raw_pace"] if p1 else 0.0
-        p1_display_pace = p1["pace"] if p1 else MIN_DAILY_FLOOR
 
         if p1_raw_pace <= 0:
-            text += f"🎉 **太棒了！现有资金已完全覆盖所有节点目标！建议非紧急期保持每天工作 {MIN_DAILY_FLOOR:.1f} 小时下限积累资金。**\n\n"
+            text += "🎉 **现有资金已完全覆盖当前所有节点目标！**\n\n"
         else:
-            subsequent_note = f"攻克后日常工时降至 {MIN_DAILY_FLOOR:.1f}h 下限"
-            if len(phases) > 1:
-                next_p = phases[1]
-                subsequent_note = f"攻克后下一阶段（至 {next_p['bottleneck']}）日需 `{next_p['pace']:.1f}h/天`"
-
-            if round(p1_raw_pace, 1) > 8.0:
-                total_days_all = calculate_workdays(today, p1_grp["dt"], off_date_set, include_weekends=True, extra_work_dates=extra_work_set)
-                weekend_relief_hours = (p1_net_gap_h / total_days_all) if total_days_all > 0 else p1_raw_pace
-                warning_box = (
-                    f"🚨 **【严重超载预警：工作日工作已超每天 8 小时上限！】**\n"
-                    f"按当前日历排班（剩 `{p1_w}` 工作日），到【{p1_title}】每天需干 **`{p1_raw_pace:.1f}` 小时**（已破8小时上限）！\n\n"
-                    f"💡 **【执行方案：启动周末分摊机制】**:\n"
-                    f"为坚守每天不超过 8 小时，建议点击下方【🏖️ 请假与周末开工日历】将更多周末设为加班日（若全开共 `{total_days_all}` 天），每天工时降至: **`{weekend_relief_hours:.1f}` 小时/天**！\n"
-                )
-            elif round(p1_raw_pace, 1) >= MIN_DAILY_FLOOR:
-                intensity_name = "中高强度攻坚期" if p1_raw_pace > 6.0 else "平稳健康期"
-                warning_box = f"⚡ **【{intensity_name}】** 每日需工作 `{p1_raw_pace:.1f}` 小时（位于 5.0h 下限 ~ 8.0h 上限内），请保持专注！\n"
-            else:
-                warning_box = f"🟢 **【非紧急储备期】** 节点实际仅需 `{p1_raw_pace:.1f}h/天`，**建议保持下限 `{MIN_DAILY_FLOOR:.1f} 小时/天`**，提前储备资金！\n"
-
             text += (
-                f"🎯 **当前决定性节点:【{p1_title}】**\n"
-                f"   └ 截止日期: `{p1_b_date}` (扣除周末与请假剩 `{p1_w}` 工作日)\n"
-                f"   └ 扣减总资金后净缺口: `{fx.format_dual_currency(p1_net_gap_m, rates)}` (`{p1_net_gap_h:.1f}h`)\n"
-                f"   👉 **当前建议工时: 每天工作 `{p1_display_pace:.1f}` 小时** (工作区间 5.0h~8.0h)\n"
-                f"   💡 *(说明: 此工时仅为今天至 `{p1_b_date}` 攻坚期要求；{subsequent_note})*\n\n"
-                f"{warning_box}\n"
+                f"🎯 **当前决定性节点**: 【**{p1_title}**】\n"
+                f"   └ 截止日期: `{p1_b_date}` (剩 `{p1_w}` 工作日)\n"
+                f"   └ 实际缺口: `{fx.format_dual_currency(p1_net_gap_m, rates)}` (`{p1_net_gap_h:.1f}h`)\n"
+                f"   👉 **当前需工作**: **`{p1_raw_pace:.1f} 小时/天`**\n\n"
             )
 
         interval_lines = []
@@ -442,18 +367,13 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                 surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else "，全额达成"
                 rounded_pace = round(pace_hours, 1)
 
-                if rounded_pace > 8.0:
-                    interval_lines.append(f"• 🚨 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`(超8h)！{surplus_str}")
-                elif rounded_pace > 6.0:
-                    interval_lines.append(f"• 🔥攻坚期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{surplus_str}")
-                else:
-                    interval_lines.append(f"• 🟢平稳期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{surplus_str}")
+                interval_lines.append(f"• `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{surplus_str}")
                 prev_d = d_dt
             except Exception:
                 pass
 
         if not show_all_intervals:
-            text += "🧭 **【战略攻坚梯次规划】**:\n"
+            text += "🧭 **【各阶段排班规划】**:\n"
             for idx, p in enumerate(phases, 1):
                 s_name = "今天" if p["start_dt"] == today else p["start_dt"].strftime("%m-%d")
                 e_name = date_groups[p["bottleneck"]]["dt"].strftime("%m-%d")
@@ -465,17 +385,8 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                     short_titles += f" 等 {len(p_titles)} 个节点"
                 
                 p_rounded = round(p["pace"], 1)
-                if p_rounded > 8.0:
-                    tag = f"🚨阶段{idx}·攻坚"
-                    tip = f"需 `{p_rounded:.1f}h/天`(超8h)！"
-                elif p_rounded > 6.0:
-                    tag = f"🔥阶段{idx}·冲刺"
-                    tip = f"需 `{p_rounded:.1f}h/天`"
-                else:
-                    tag = f"🟢阶段{idx}·平稳"
-                    tip = f"需 `{p_rounded:.1f}h/天`"
-                text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}工作日 | {short_titles}): {tip}\n"
-            text += "\n*(💡 提示：点击下方【🔍 查看各节点细分账目】可展开全量细分区间)*\n"
+                text += f"• **阶段{idx}** `[{s_name} ➔ {e_name}]` ({p['workdays']}工作日 | {short_titles}): 需 `{p_rounded:.1f}h/天`\n"
+            text += "\n*(💡 提示：点击下方【🔍 查看细分账目】可展开全量细分区间)*\n"
         else:
             text += "🔍 **【各节点逐项区间细分审计】**:\n"
             text += "\n".join(interval_lines) + "\n"
@@ -684,21 +595,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消并返回", callback_data="refresh")]])
 
-    # 预先检查弹窗预警
-    alert_msg = check_overload_alert(chat_id)
-
     if data == "refresh":
         user_states.pop(chat_id, None)
-        if alert_msg:
-            try:
-                await query.answer(text=alert_msg, show_alert=True)
-            except Exception:
-                pass
-        else:
-            try:
-                await query.answer()
-            except Exception:
-                pass
+        try:
+            await query.answer()
+        except Exception:
+            pass
 
         text = format_overview(chat_id)
         await safe_edit_message(
@@ -867,11 +769,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_d_str = parts[2]
         m_id = int(parts[3])
         title = db.update_milestone_date(m_id, chat_id, new_d_str)
-        alert_msg = check_overload_alert(chat_id)
-        if alert_msg:
-            await query.answer(alert_msg, show_alert=True)
-        else:
+        try:
             await query.answer(f"✅ 已将【{title}】截止日期更新为 {new_d_str}！", show_alert=False)
+        except Exception:
+            pass
         text = f"✅ 已成功将【**{title}**】截止日期更新为 `{new_d_str}`！\n\n" + format_overview(chat_id)
         await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id))
 
@@ -901,11 +802,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rate = profile["hourly_rate"] if profile else 0.0
         hourly_str = fx.format_hourly_rate(rate, rates)
 
-        alert_msg = check_overload_alert(chat_id)
-        if alert_msg:
-            await query.answer(alert_msg, show_alert=True)
-        else:
+        try:
             await query.answer(f"✅ 成功添加【{title}】（截止: {chosen_date_str}）！", show_alert=False)
+        except Exception:
+            pass
 
         res_text = (
             f"✅ 成功添加阶段节点 **{title}**！\n"
@@ -995,12 +895,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db.add_off_day(chat_id, toggle_date_str, "日历点选")
                 action_tip = f"已将 {toggle_date_str} 设为请假休息 🏖️"
 
-        # 检查点选后是否导致严重超载
-        post_alert = check_overload_alert(chat_id)
-        if post_alert:
-            await query.answer(text=post_alert, show_alert=True)
-        else:
+        try:
             await query.answer(action_tip, show_alert=False)
+        except Exception:
+            pass
 
         # 刷新当前月份日历
         cal_kb = build_calendar_keyboard(chat_id, cur_year, cur_month)
