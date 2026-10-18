@@ -250,7 +250,7 @@ def build_datepicker_keyboard(year: int, month: int, prefix: str = "mspick", ext
     ])
     return InlineKeyboardMarkup(keyboard)
 
-def format_overview(chat_id: int, show_all_intervals: bool = False) -> str:
+def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_intervals: bool = False) -> str:
     profile = db.get_profile(chat_id)
     if not profile:
         return "👋 欢迎使用财务与目标追踪机器人！\n目前尚未配置任何数据，请点击下方按钮初始化数据。"
@@ -272,20 +272,27 @@ def format_overview(chat_id: int, show_all_intervals: bool = False) -> str:
     
     # 获取阶段节点
     milestones = db.get_milestones(chat_id, status="pending")
-    text += "\n📅 **【进行中的阶段节点】**:\n"
     if not milestones:
-        text += "暂无阶段节点，点击【➕ 添加阶段节点】新建。\n"
+        text += "\n📅 **【进行中的阶段节点】**:\n暂无阶段节点，点击【➕ 添加阶段节点】新建。\n"
     else:
         # 按截止日期由近及远排序（使用 parse_date_safely 防止字符串排序问题）
         milestones = sorted(milestones, key=lambda x: parse_date_safely(x['target_date']))
 
-        # 阶段节点列表展示 (若超过 6 项展示前 6 项，避免手机消息过长)
-        show_ms = milestones[:6] if len(milestones) > 6 else milestones
-        for idx, m in enumerate(show_ms, 1):
-            money_dual = fx.format_dual_currency(m['target_money'], rates)
-            text += f"{idx}. 📌 **{m['title']}** (`{m['target_date']}`): `{money_dual}` (`{m['target_hours']:.1f}h`)\n"
-        if len(milestones) > 6:
-            text += f"   *(...其余 {len(milestones) - 6} 项远期节点，可在【📋 管理/完成节点】中查看完整列表)*\n"
+        if not show_all_milestones and len(milestones) > 3:
+            show_ms = milestones[:3]
+            text += f"\n📅 **【进行中的阶段节点】** (近期 3 项 · 共 {len(milestones)} 项):\n"
+            for idx, m in enumerate(show_ms, 1):
+                money_dual = fx.format_dual_currency(m['target_money'], rates)
+                text += f"{idx}. 📌 **{m['title']}** (`{m['target_date']}`): `{money_dual}` (`{m['target_hours']:.1f}h`)\n"
+            text += f"   *(...其余 {len(milestones) - 3} 项已折叠，点击下方【🔍 展开全部待办节点】查看)*\n"
+        else:
+            header_note = f" (全部 {len(milestones)} 项)" if len(milestones) > 3 else ""
+            text += f"\n📅 **【进行中的阶段节点】**{header_note}:\n"
+            for idx, m in enumerate(milestones, 1):
+                money_dual = fx.format_dual_currency(m['target_money'], rates)
+                text += f"{idx}. 📌 **{m['title']}** (`{m['target_date']}`): `{money_dual}` (`{m['target_hours']:.1f}h`)\n"
+            if len(milestones) > 3 and show_all_milestones:
+                text += "   *(💡 提示：点击下方【🔼 收起远期节点】可恢复清爽看板)*\n"
 
         # 智能瓶颈推算：资金优先冲销最近节点
         user_off_days = db.get_off_days(chat_id)
@@ -488,12 +495,13 @@ def format_overview(chat_id: int, show_all_intervals: bool = False) -> str:
     text += "─────────────────\n请选择你要进行的操作："
     return text
 
-def get_main_keyboard(chat_id: int, show_all_intervals: bool = False):
-    toggle_btn = (
-        InlineKeyboardButton("🔼 收起细分账目", callback_data="toggle_intervals_off")
-        if show_all_intervals
-        else InlineKeyboardButton("🔍 查看各节点细分账目", callback_data="toggle_intervals_on")
-    )
+def get_main_keyboard(chat_id: int, show_all_milestones: bool = False, show_all_intervals: bool = False):
+    milestones = db.get_milestones(chat_id, status="pending")
+    has_more_ms = len(milestones) > 3
+
+    m_val = 1 if show_all_milestones else 0
+    i_val = 1 if show_all_intervals else 0
+
     keyboard = [
         [
             InlineKeyboardButton("💰 更新今天的总资金", callback_data="set_balance"),
@@ -507,11 +515,29 @@ def get_main_keyboard(chat_id: int, show_all_intervals: bool = False):
             InlineKeyboardButton("📋 管理/完成节点", callback_data="list_milestones"),
             InlineKeyboardButton("🏖️ 请假与周末开工日历", callback_data="manage_off_days"),
         ],
-        [
-            toggle_btn,
-            InlineKeyboardButton("🔄 刷新看板与汇率", callback_data="refresh"),
-        ]
     ]
+
+    toggle_row = []
+    if has_more_ms:
+        if show_all_milestones:
+            toggle_row.append(InlineKeyboardButton("🔼 收起远期节点", callback_data=f"tg_v_0_{i_val}"))
+        else:
+            toggle_row.append(InlineKeyboardButton(f"🔍 展开待办节点({len(milestones)})", callback_data=f"tg_v_1_{i_val}"))
+
+    if show_all_intervals:
+        toggle_row.append(InlineKeyboardButton("🔼 收起细分账目", callback_data=f"tg_v_{m_val}_0"))
+    else:
+        toggle_row.append(InlineKeyboardButton("🔍 查看细分账目", callback_data=f"tg_v_{m_val}_1"))
+
+    if len(toggle_row) == 2:
+        keyboard.append(toggle_row)
+        keyboard.append([InlineKeyboardButton("🔄 刷新看板与汇率", callback_data="refresh")])
+    elif len(toggle_row) == 1:
+        toggle_row.append(InlineKeyboardButton("🔄 刷新看板与汇率", callback_data="refresh"))
+        keyboard.append(toggle_row)
+    else:
+        keyboard.append([InlineKeyboardButton("🔄 刷新看板与汇率", callback_data="refresh")])
+
     return InlineKeyboardMarkup(keyboard)
 
 def get_reminder_keyboard(chat_id: int):
@@ -680,21 +706,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=text,
             reply_markup=get_main_keyboard(chat_id)
         )
+    elif data.startswith("tg_v_"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        parts = data.split("_")
+        show_m = (parts[2] == "1")
+        show_i = (parts[3] == "1")
+        text = format_overview(chat_id, show_all_milestones=show_m, show_all_intervals=show_i)
+        await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id, show_all_milestones=show_m, show_all_intervals=show_i))
+
     elif data == "toggle_intervals_on":
         try:
             await query.answer()
         except Exception:
             pass
-        text = format_overview(chat_id, show_all_intervals=True)
-        await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id, show_all_intervals=True))
+        text = format_overview(chat_id, show_all_milestones=False, show_all_intervals=True)
+        await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id, show_all_milestones=False, show_all_intervals=True))
 
     elif data == "toggle_intervals_off":
         try:
             await query.answer()
         except Exception:
             pass
-        text = format_overview(chat_id, show_all_intervals=False)
-        await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id, show_all_intervals=False))
+        text = format_overview(chat_id, show_all_milestones=False, show_all_intervals=False)
+        await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id, show_all_milestones=False, show_all_intervals=False))
 
     elif data == "add_balance":
         user_states[chat_id] = {"action": "add_balance"}
