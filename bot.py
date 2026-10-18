@@ -77,10 +77,17 @@ def calculate_workdays(start_date: date, end_date: date, off_dates: set = None, 
     return workdays
 
 def parse_date_safely(d_str: str) -> date:
-    """安全解析各种日期格式并返回 date 对象"""
+    """安全解析各种日期格式并返回 date 对象（支持 YYYY-MM-DD, 以及省略年份的 MM-DD / MM/DD 智能年份推断）"""
     try:
         parts = d_str.strip().replace('/', '-').split('-')
-        return date(int(parts[0]), int(parts[1]), int(parts[2]))
+        today = get_today()
+        if len(parts) == 3:
+            return date(int(parts[0]), int(parts[1]), int(parts[2]))
+        elif len(parts) == 2:
+            m, d = int(parts[0]), int(parts[1])
+            y = today.year if (m > today.month or (m == today.month and d >= today.day)) else today.year + 1
+            return date(y, m, d)
+        return date.max
     except Exception:
         return date.max
 
@@ -243,7 +250,7 @@ def build_datepicker_keyboard(year: int, month: int, prefix: str = "mspick", ext
     ])
     return InlineKeyboardMarkup(keyboard)
 
-def format_overview(chat_id: int) -> str:
+def format_overview(chat_id: int, show_all_intervals: bool = False) -> str:
     profile = db.get_profile(chat_id)
     if not profile:
         return "👋 欢迎使用财务与目标追踪机器人！\n目前尚未配置任何数据，请点击下方按钮初始化数据。"
@@ -272,13 +279,13 @@ def format_overview(chat_id: int) -> str:
         # 按截止日期由近及远排序（使用 parse_date_safely 防止字符串排序问题）
         milestones = sorted(milestones, key=lambda x: parse_date_safely(x['target_date']))
 
-        # 阶段节点列表展示 (若超过 8 项展示前 8 项，避免消息超长)
-        show_ms = milestones[:8] if len(milestones) > 8 else milestones
+        # 阶段节点列表展示 (若超过 6 项展示前 6 项，避免手机消息过长)
+        show_ms = milestones[:6] if len(milestones) > 6 else milestones
         for idx, m in enumerate(show_ms, 1):
             money_dual = fx.format_dual_currency(m['target_money'], rates)
             text += f"{idx}. 📌 **{m['title']}** (`{m['target_date']}`): `{money_dual}` (`{m['target_hours']:.1f}h`)\n"
-        if len(milestones) > 8:
-            text += f"   *(...其余 {len(milestones) - 8} 项远期节点，可在【📋 管理/完成节点】中查看完整列表)*\n"
+        if len(milestones) > 6:
+            text += f"   *(...其余 {len(milestones) - 6} 项远期节点，可在【📋 管理/完成节点】中查看完整列表)*\n"
 
         # 智能瓶颈推算：资金优先冲销最近节点
         user_off_days = db.get_off_days(chat_id)
@@ -330,19 +337,21 @@ def format_overview(chat_id: int) -> str:
             chosen_pace = max(MIN_DAILY_FLOOR, best_pace)
             bottleneck_d = remaining_dates[best_idx]
             phase_dates = remaining_dates[:best_idx + 1]
+            start_calc = phase_start_dt if phase_start_dt == today else (phase_start_dt + timedelta(days=1))
+            phase_w = calculate_workdays(start_calc, date_groups[bottleneck_d]["dt"], off_date_set, extra_work_dates=extra_work_set)
             phases.append({
                 "bottleneck": bottleneck_d,
                 "pace": chosen_pace,
                 "raw_pace": best_pace,
-                "dates": phase_dates
+                "dates": phase_dates,
+                "start_dt": phase_start_dt,
+                "workdays": phase_w
             })
 
             for d_str in phase_dates:
                 date_pace_map[d_str] = chosen_pace
 
-            start_calc = phase_start_dt if phase_start_dt == today else (phase_start_dt + timedelta(days=1))
-            total_w = calculate_workdays(start_calc, date_groups[bottleneck_d]["dt"], off_date_set, extra_work_dates=extra_work_set)
-            total_earned = total_w * chosen_pace * rate
+            total_earned = phase_w * chosen_pace * rate
             total_due = sum(date_groups[d]["total_money"] for d in phase_dates)
             if not phases[1:]:
                 total_due += initial_uncovered_overdue
@@ -436,9 +445,34 @@ def format_overview(chat_id: int) -> str:
             except Exception:
                 pass
 
-        if interval_lines:
-            text += "🛡️ **【阶段区间衔接与真实工时防护】**:\n"
+        if not show_all_intervals:
+            text += "🧭 **【战略攻坚梯次规划】**:\n"
+            for idx, p in enumerate(phases, 1):
+                s_name = "今天" if p["start_dt"] == today else p["start_dt"].strftime("%m-%d")
+                e_name = date_groups[p["bottleneck"]]["dt"].strftime("%m-%d")
+                p_titles = []
+                for d in p["dates"]:
+                    p_titles.extend(date_groups[d]["titles"])
+                short_titles = " + ".join(p_titles[:2])
+                if len(p_titles) > 2:
+                    short_titles += f" 等 {len(p_titles)} 个节点"
+                
+                p_rounded = round(p["pace"], 1)
+                if p_rounded > 8.0:
+                    tag = f"🚨阶段{idx}·攻坚"
+                    tip = f"需 `{p_rounded:.1f}h/天`(超8h)！"
+                elif p_rounded > 6.0:
+                    tag = f"🔥阶段{idx}·冲刺"
+                    tip = f"需 `{p_rounded:.1f}h/天`"
+                else:
+                    tag = f"🟢阶段{idx}·平稳"
+                    tip = f"需 `{p_rounded:.1f}h/天`"
+                text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}工作日 | {short_titles}): {tip}\n"
+            text += "\n*(💡 提示：点击下方【🔍 查看各节点细分账目】可展开全量细分区间)*\n"
+        else:
+            text += "🔍 **【各节点逐项区间细分审计】**:\n"
             text += "\n".join(interval_lines) + "\n"
+            text += "\n*(💡 提示：点击下方【🔼 收起细分账目】可返回清爽看板)*\n"
 
         # 4. 统计日历调度
         upcoming_offs = [od["off_date"] for od in user_off_days if od["off_date"] >= today.strftime("%Y-%m-%d")]
@@ -454,7 +488,12 @@ def format_overview(chat_id: int) -> str:
     text += "─────────────────\n请选择你要进行的操作："
     return text
 
-def get_main_keyboard(chat_id: int):
+def get_main_keyboard(chat_id: int, show_all_intervals: bool = False):
+    toggle_btn = (
+        InlineKeyboardButton("🔼 收起细分账目", callback_data="toggle_intervals_off")
+        if show_all_intervals
+        else InlineKeyboardButton("🔍 查看各节点细分账目", callback_data="toggle_intervals_on")
+    )
     keyboard = [
         [
             InlineKeyboardButton("💰 更新今天的总资金", callback_data="set_balance"),
@@ -469,6 +508,7 @@ def get_main_keyboard(chat_id: int):
             InlineKeyboardButton("🏖️ 请假与周末开工日历", callback_data="manage_off_days"),
         ],
         [
+            toggle_btn,
             InlineKeyboardButton("🔄 刷新看板与汇率", callback_data="refresh"),
         ]
     ]
@@ -518,6 +558,39 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ 备份文件读取失败: {e}")
     else:
         await update.message.reply_text("⚠️ 数据库文件暂不存在。")
+
+async def seed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """一键生成 Render 环境变量 SEED_DATA 命令 /seed 或 /export"""
+    chat_id = update.effective_chat.id
+    if not is_owner(chat_id):
+        await update.message.reply_text("⛔ 抱歉，仅机器人所有者可导出数据配置。")
+        return
+    try:
+        import export_seed
+        seed_str = export_seed.generate_seed()
+        if not seed_str:
+            await update.message.reply_text("⚠️ 数据库为空或暂无数据，无法生成 SEED_DATA。")
+            return
+        
+        reply_msg = (
+            "🌱 **【Render 云端永久固化配置】**\n\n"
+            "为防止 Render 免费版休眠重启或重新部署时数据丢失，请将下方代码块完整复制，粘贴到 Render 仪表板的 **Environment Variables** 中的 `SEED_DATA`：\n\n"
+            f"```text\n{seed_str}\n```\n\n"
+            "💡 **提示**：复制上方长文本后填入 Render 环境变量即可，重新部署时云端将自动以最新账目开机！"
+        )
+        if len(reply_msg) > 4000:
+            import io
+            buf = io.BytesIO(seed_str.encode("utf-8"))
+            buf.name = "SEED_DATA.txt"
+            await update.message.reply_document(
+                document=buf,
+                caption="🌱 **【Render 云端 SEED_DATA 配置文件】**\n由于数据较长，已导出为文本文件。打开并复制文件全部内容填入 Render 即可！"
+            )
+        else:
+            await update.message.reply_text(reply_msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Failed to generate seed data: {e}")
+        await update.message.reply_text(f"❌ 生成 SEED_DATA 失败: {e}")
 
 async def daily_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """每日定时触发的提醒任务：弹窗直接引导用户更新今天的最新总资产"""
@@ -607,6 +680,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=text,
             reply_markup=get_main_keyboard(chat_id)
         )
+    elif data == "toggle_intervals_on":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        text = format_overview(chat_id, show_all_intervals=True)
+        await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id, show_all_intervals=True))
+
+    elif data == "toggle_intervals_off":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        text = format_overview(chat_id, show_all_intervals=False)
+        await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id, show_all_intervals=False))
+
     elif data == "add_balance":
         user_states[chat_id] = {"action": "add_balance"}
         await safe_edit_message(
@@ -673,7 +762,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await safe_edit_message(query, prompt, reply_markup=cancel_btn)
     
-    elif data == "list_milestones":
+    elif data == "list_milestones" or data.startswith("list_m_page_"):
+        page = int(data.replace("list_m_page_", "")) if data.startswith("list_m_page_") else 0
         milestones = db.get_milestones(chat_id, status="pending")
         if not milestones:
             await safe_edit_message(
@@ -683,17 +773,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        page_size = 5
+        total_pages = (len(milestones) + page_size - 1) // page_size
+        page = max(0, min(page, total_pages - 1))
+        paged_ms = milestones[page * page_size : (page + 1) * page_size]
+
+        rates = fx.get_exchange_rates()
         keyboard = []
-        for m in milestones:
+        for m in paged_ms:
+            money_str = fx.format_dual_currency(m['target_money'], rates)
             keyboard.append([
                 InlineKeyboardButton(f"✅ 完成: {m['title']}", callback_data=f"done_m_{m['id']}"),
-                InlineKeyboardButton("📅 改日期", callback_data=f"editdate_m_{m['id']}"),
+                InlineKeyboardButton(f"📅 {m['target_date']}", callback_data=f"editdate_m_{m['id']}"),
                 InlineKeyboardButton("🗑️ 删除", callback_data=f"del_m_{m['id']}")
             ])
-        keyboard.append([InlineKeyboardButton("🔙 返回看板", callback_data="refresh")])
+
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("◀️ 上一页", callback_data=f"list_m_page_{page - 1}"))
+        nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages} 页", callback_data="cal_ignore"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("下一页 ▶️", callback_data=f"list_m_page_{page + 1}"))
+
+        keyboard.append(nav_row)
+        keyboard.append([InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")])
+
         await safe_edit_message(
             query,
-            "📋 **阶段节点管理**：\n点击即可完成、修改截止日历或删除对应节点：",
+            f"📋 **阶段节点管理 (共 {len(milestones)} 项 · 第 {page + 1}/{total_pages} 页)**：\n点击即可完成、修改截止日期或删除对应节点：",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     
@@ -962,43 +1069,43 @@ def parse_direct_command(text: str, chat_id: int) -> tuple[bool, str]:
         title, deducted = db.complete_milestone(target["id"], chat_id)
         return True, f"🎉 恭喜！节点【**{title}**】已标记完成！\n💰 已按计划自动从总资金扣除 `{fx.format_dual_currency(deducted, rates)}`。"
 
-    # 6. 新增带截止日期的节点: 租房 800欧 2026-11-01
+    # 6. 新增带截止日期的节点: 租房 800欧 2026-11-01 或 租房 800欧 11-01
     parts = t.split()
     if len(parts) == 3:
         title, amt_str, date_str = parts[0], parts[1], parts[2]
         try:
-            clean_date = date_str.strip().replace('/', '-')
-            datetime.strptime(clean_date, "%Y-%m-%d")
-            profile = db.get_profile(chat_id)
-            rate = profile["hourly_rate"] if profile else 0.0
-            
-            if amt_str.lower().endswith("h") or amt_str.endswith("小时"):
-                clean_h = amt_str.lower().replace("h", "").replace("小时", "")
-                hours = float(clean_h)
-                money_eur = hours * rate
-            else:
-                money_eur, _ = fx.parse_currency_input(amt_str, rates)
-                hours = (money_eur / rate) if rate > 0 else 0.0
+            parsed_d = parse_date_safely(date_str)
+            if parsed_d != date.max:
+                clean_date = parsed_d.strftime("%Y-%m-%d")
+                profile = db.get_profile(chat_id)
+                rate = profile["hourly_rate"] if profile else 0.0
+                
+                if amt_str.lower().endswith("h") or amt_str.endswith("小时"):
+                    clean_h = amt_str.lower().replace("h", "").replace("小时", "")
+                    hours = float(clean_h)
+                    money_eur = hours * rate
+                else:
+                    money_eur, _ = fx.parse_currency_input(amt_str, rates)
+                    hours = (money_eur / rate) if rate > 0 else 0.0
 
-            db.add_milestone(chat_id, title, clean_date, hours, money_eur)
-            return True, f"✅ 成功添加阶段节点【**{title}**】！\n📅 截止: `{clean_date}` | 💵 目标: `{fx.format_dual_currency(money_eur, rates)}` (`{hours:.1f}h`)"
+                db.add_milestone(chat_id, title, clean_date, hours, money_eur)
+                return True, f"✅ 成功添加阶段节点【**{title}**】！\n📅 截止: `{clean_date}` | 💵 目标: `{fx.format_dual_currency(money_eur, rates)}` (`{hours:.1f}h`)"
         except Exception:
             pass
 
-    # 7. 请假或周末开工: 请假 2026-10-25 / 加班 2026-10-18
+    # 7. 请假或周末开工: 请假 2026-10-25 / 加班 2026-10-18 / 请假 10-25
     m_cal = re.match(r"^(请假|休息|加班|开工)\s+(.+)$", t)
     if m_cal:
-        action_type, d_str = m_cal.group(1), m_cal.group(2).strip().replace('/', '-')
-        try:
-            datetime.strptime(d_str, "%Y-%m-%d").date()
+        action_type, d_str = m_cal.group(1), m_cal.group(2).strip()
+        parsed_cal = parse_date_safely(d_str)
+        if parsed_cal != date.max:
+            clean_cal = parsed_cal.strftime("%Y-%m-%d")
             if action_type in ["请假", "休息"]:
-                db.add_off_day(chat_id, d_str, "文字记录")
-                return True, f"🏖️ 已将 `{d_str}` 设为请假休息日！"
+                db.add_off_day(chat_id, clean_cal, "文字记录")
+                return True, f"🏖️ 已将 `{clean_cal}` 设为请假休息日！"
             else:
-                db.add_work_day(chat_id, d_str, "文字记录")
-                return True, f"💼 已将 `{d_str}` 设为周末加班开工日！"
-        except ValueError:
-            pass
+                db.add_work_day(chat_id, clean_cal, "文字记录")
+                return True, f"💼 已将 `{clean_cal}` 设为周末加班开工日！"
 
     return False, ""
 
@@ -1018,21 +1125,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     is_delayed = True
 
             prefix = "📥 **【电脑已开机·自动同步离线记录】**\n\n" if is_delayed else ""
-            new_text = f"{prefix}{reply_text}\n\n" + format_overview(chat_id)
-            await update.message.reply_text(new_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
+            receipt_text = f"{prefix}{reply_text}"
+            receipt_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("👀 查看完整财务看板", callback_data="refresh"),
+                    InlineKeyboardButton("💰 记下一笔", callback_data="add_balance"),
+                ]
+            ])
+            await update.message.reply_text(receipt_text, reply_markup=receipt_kb, parse_mode="Markdown")
             return
 
         tip_text = (
-            "💡 **快捷记账与记录提示**（手机上直接发文字，电脑休眠也能排队记录）：\n\n"
+            "💡 **快捷记账与记录提示**（手机直接发文字，即发即记）：\n\n"
             "• **记一笔收入**：直接发送 `+300欧`、`+2000元` 或 `收入 500`\n"
             "• **记一笔支出**：直接发送 `-50欧`、`-200元` 或 `支出 100`\n"
             "• **更新总资金**：发送 `资金 5000` 或 `总资金 50000元`\n"
             "• **更新时薪**：发送 `时薪 20` 或 `时薪 25刀`\n"
             "• **完成节点**：发送 `完成 健身卡` 或 `搞定 兼职项目`\n"
-            "• **添加节点**：发送 `买电脑 1200欧 2026-12-01`\n"
-            "• **请假/加班**：发送 `请假 2026-10-25` 或 `加班 2026-10-18`\n\n"
-            "📱 **电脑未开机时**：您直接在手机发以上文字，电脑开机后会自动批量同步、入库并重新测算！\n"
-            "输入 /start 可直接查看最新财务看板。"
+            "• **添加节点**：发送 `买电脑 1200欧 12-01` 或 `租房 800欧 2026-11-01`\n"
+            "• **请假/加班**：发送 `请假 10-25` 或 `加班 10-18`\n\n"
+            "📦 **云端数据与备份**：\n"
+            "• `/seed` 或 `/export`：生成 Render 永久环境变量 `SEED_DATA`\n"
+            "• `/backup`：一键导出本地数据库 `.db` 文件\n\n"
+            "输入 /start 可直接调出最新财务看板。"
         )
         await update.message.reply_text(tip_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
         return
@@ -1165,8 +1280,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             added_dates = []
             if "~" in date_part:
                 start_s, end_s = date_part.split("~")
-                start_d = datetime.strptime(start_s.strip(), "%Y-%m-%d").date()
-                end_d = datetime.strptime(end_s.strip(), "%Y-%m-%d").date()
+                start_d = parse_date_safely(start_s.strip())
+                end_d = parse_date_safely(end_s.strip())
+                if start_d == date.max or end_d == date.max:
+                    raise ValueError("Invalid date")
                 if start_d > end_d:
                     start_d, end_d = end_d, start_d
                 
@@ -1177,7 +1294,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     added_dates.append(d_str)
                     curr += timedelta(days=1)
             else:
-                target_d = datetime.strptime(date_part.strip(), "%Y-%m-%d").date()
+                target_d = parse_date_safely(date_part.strip())
+                if target_d == date.max:
+                    raise ValueError("Invalid date")
                 d_str = target_d.strftime("%Y-%m-%d")
                 db.add_off_day(chat_id, d_str, note)
                 added_dates.append(d_str)
@@ -1190,8 +1309,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(res_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
         except ValueError:
             await update.message.reply_text(
-                "❌ 日期格式错误，请按照 `YYYY-MM-DD` 格式输入，例如：\n"
-                "`2026-10-14` 或 `2026-10-15~2026-10-18 假期`"
+                "❌ 日期格式错误，支持 `MM-DD` 或 `YYYY-MM-DD`，例如：\n"
+                "`10-14`、`2026-10-14` 或 `10-15~10-18 假期`"
             )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1261,6 +1380,7 @@ def main():
     # 注册命令与消息回调
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler(["seed", "export"], seed_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
