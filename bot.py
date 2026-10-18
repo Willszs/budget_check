@@ -235,15 +235,12 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
             for idx, m in enumerate(show_ms, 1):
                 money_dual = fx.format_dual_currency(m['target_money'], rates)
                 text += f"{idx}. 📌 **{m['title']}** (`{m['target_date']}`): `{money_dual}` (`{m['target_hours']:.1f}h`)\n"
-            text += f"   *(...其余 {len(milestones) - 3} 项已折叠，点击下方【🔍 展开全部待办节点】查看)*\n"
         else:
-            header_note = f" (全部 {len(milestones)} 项)" if len(milestones) > 3 else ""
+            header_note = f" (共 {len(milestones)} 项)" if len(milestones) > 3 else ""
             text += f"\n📅 **【进行中的阶段节点】**{header_note}:\n"
             for idx, m in enumerate(milestones, 1):
                 money_dual = fx.format_dual_currency(m['target_money'], rates)
                 text += f"{idx}. 📌 **{m['title']}** (`{m['target_date']}`): `{money_dual}` (`{m['target_hours']:.1f}h`)\n"
-            if len(milestones) > 3 and show_all_milestones:
-                text += "   *(💡 提示：点击下方【🔼 收起远期节点】可恢复清爽看板)*\n"
 
         # 智能瓶颈推算：资金优先冲销最近节点
         user_off_days = db.get_off_days(chat_id)
@@ -319,28 +316,6 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
 
         text += "─────────────────\n"
 
-        p1 = phases[0] if phases else None
-        p1_b_date = p1["bottleneck"] if p1 else ""
-        p1_grp = date_groups.get(p1_b_date)
-        p1_title = " + ".join(p1_grp["titles"]) if p1_grp else ""
-        p1_w = calculate_workdays(today, p1_grp["dt"], off_date_set, extra_work_dates=extra_work_set) if p1_grp else 0
-        p1_cum_m = sum(date_groups[d]["total_money"] for d in sorted_dates if parse_date_safely(d) <= p1_grp["dt"]) if p1_grp else 0.0
-        p1_net_gap_m = max(0.0, p1_cum_m - balance)
-        p1_net_gap_h = (p1_net_gap_m / rate) if rate > 0 else 0.0
-
-        p1_raw_pace = p1["raw_pace"] if p1 else 0.0
-
-        if p1_raw_pace <= 0:
-            text += "🎉 **现有资金已完全覆盖当前所有节点目标！**\n\n"
-        else:
-            node_tag = "🚨攻坚期" if round(p1_raw_pace, 1) > 8.0 else ("🔥冲刺期" if round(p1_raw_pace, 1) > 6.0 else "🟢平稳期")
-            text += (
-                f"🎯 **当前决定性节点**: 【**{p1_title}**】 ({node_tag})\n"
-                f"   └ 截止日期: `{p1_b_date}` (剩 `{p1_w}` 工作日)\n"
-                f"   └ 实际缺口: `{fx.format_dual_currency(p1_net_gap_m, rates)}` (`{p1_net_gap_h:.1f}h`)\n"
-                f"   👉 **当前需工作**: **`{p1_raw_pace:.1f} 小时/天`**\n\n"
-            )
-
         interval_lines = []
         cur_cash = balance
         prev_d = today
@@ -398,22 +373,9 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                 else:
                     tag = f"🟢阶段{idx}·平稳"
                 text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}工作日 | {short_titles}): 需 `{p_rounded:.1f}h/天`\n"
-            text += "\n*(💡 提示：点击下方【🔍 查看细分账目】可展开全量细分区间)*\n"
         else:
             text += "🔍 **【各节点逐项区间细分审计】**:\n"
             text += "\n".join(interval_lines) + "\n"
-            text += "\n*(💡 提示：点击下方【🔼 收起细分账目】可返回清爽看板)*\n"
-
-        # 4. 统计日历调度
-        upcoming_offs = [od["off_date"] for od in user_off_days if od["off_date"] >= today.strftime("%Y-%m-%d")]
-        upcoming_works = [wd["work_date"] for wd in user_work_days if wd["work_date"] >= today.strftime("%Y-%m-%d")]
-        cal_summary = []
-        if upcoming_offs:
-            cal_summary.append(f"🏖️ 排除 `{len(upcoming_offs)}` 天不可工作日")
-        if upcoming_works:
-            cal_summary.append(f"💼 开启 `{len(upcoming_works)}` 天周末开工加班日")
-        if cal_summary:
-            text += f"\n📅 **日历调度**: {' | '.join(cal_summary)}\n"
 
     text += "─────────────────\n请选择你要进行的操作："
     return text
