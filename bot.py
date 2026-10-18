@@ -333,8 +333,9 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
         if p1_raw_pace <= 0:
             text += "🎉 **现有资金已完全覆盖当前所有节点目标！**\n\n"
         else:
+            node_tag = "🚨攻坚期" if round(p1_raw_pace, 1) > 8.0 else ("🔥冲刺期" if round(p1_raw_pace, 1) > 6.0 else "🟢平稳期")
             text += (
-                f"🎯 **当前决定性节点**: 【**{p1_title}**】\n"
+                f"🎯 **当前决定性节点**: 【**{p1_title}**】 ({node_tag})\n"
                 f"   └ 截止日期: `{p1_b_date}` (剩 `{p1_w}` 工作日)\n"
                 f"   └ 实际缺口: `{fx.format_dual_currency(p1_net_gap_m, rates)}` (`{p1_net_gap_h:.1f}h`)\n"
                 f"   👉 **当前需工作**: **`{p1_raw_pace:.1f} 小时/天`**\n\n"
@@ -367,7 +368,12 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                 surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else "，全额达成"
                 rounded_pace = round(pace_hours, 1)
 
-                interval_lines.append(f"• `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{surplus_str}")
+                if rounded_pace > 8.0:
+                    interval_lines.append(f"• 🚨攻坚期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{surplus_str}")
+                elif rounded_pace > 6.0:
+                    interval_lines.append(f"• 🔥冲刺期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{surplus_str}")
+                else:
+                    interval_lines.append(f"• 🟢平稳期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{surplus_str}")
                 prev_d = d_dt
             except Exception:
                 pass
@@ -385,7 +391,13 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                     short_titles += f" 等 {len(p_titles)} 个节点"
                 
                 p_rounded = round(p["pace"], 1)
-                text += f"• **阶段{idx}** `[{s_name} ➔ {e_name}]` ({p['workdays']}工作日 | {short_titles}): 需 `{p_rounded:.1f}h/天`\n"
+                if p_rounded > 8.0:
+                    tag = f"🚨阶段{idx}·攻坚"
+                elif p_rounded > 6.0:
+                    tag = f"🔥阶段{idx}·冲刺"
+                else:
+                    tag = f"🟢阶段{idx}·平稳"
+                text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}工作日 | {short_titles}): 需 `{p_rounded:.1f}h/天`\n"
             text += "\n*(💡 提示：点击下方【🔍 查看细分账目】可展开全量细分区间)*\n"
         else:
             text += "🔍 **【各节点逐项区间细分审计】**:\n"
