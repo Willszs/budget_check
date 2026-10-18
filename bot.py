@@ -112,7 +112,7 @@ def check_overload_alert(chat_id: int) -> str | None:
                 workdays = calculate_workdays(today, target_dt, off_date_set, include_weekends=False, extra_work_dates=extra_work_set)
                 if workdays > 0:
                     daily_h = gap_hours / workdays
-                    if daily_h > 8.0 and daily_h > max_daily_h:
+                    if round(daily_h, 1) > 8.0 and daily_h > max_daily_h:
                         max_daily_h = daily_h
                         overload_title = m['title']
                         total_days_all = calculate_workdays(today, target_dt, off_date_set, include_weekends=True, extra_work_dates=extra_work_set)
@@ -120,7 +120,7 @@ def check_overload_alert(chat_id: int) -> str | None:
         except Exception:
             pass
 
-    if overload_title and max_daily_h > 8.0:
+    if overload_title and round(max_daily_h, 1) > 8.0:
         return (
             f"🚨 超载预警：【{overload_title}】截止日前工作日需每天 {max_daily_h:.1f}h(已超8小时上限)！\n"
             f"💡 建议在日历中点击周末开启加班分摊，可降至 {weekend_relief_hours:.1f}h/天。"
@@ -278,91 +278,9 @@ def format_overview(chat_id: int) -> str:
         extra_work_set = {wd["work_date"] for wd in user_work_days}
         today = get_today()
 
-        # 核心算法：滚动累计强度（Rolling Cumulative Workload）分析
-        cumulative_target_money = 0.0
-        analyzed_stages = []
-        bottleneck_stage = None
-        max_daily_req = 0.0
-
-        for m in milestones:
-            m_money = m['target_money']
-            m_date_str = m['target_date']
-            cumulative_target_money += m_money
-            cum_gap_money = max(0.0, cumulative_target_money - balance)
-            cum_gap_hours = (cum_gap_money / rate) if rate > 0 else 0.0
-
-            workdays = 0
-            is_overdue = False
-            try:
-                target_dt = datetime.strptime(m_date_str, "%Y-%m-%d").date()
-                if target_dt < today:
-                    is_overdue = True
-                else:
-                    workdays = calculate_workdays(today, target_dt, off_date_set, extra_work_dates=extra_work_set)
-            except ValueError:
-                workdays = 0
-
-            daily_req = (cum_gap_hours / workdays) if workdays > 0 else 0.0
-            stage_info = {
-                "title": m['title'],
-                "date": m_date_str,
-                "target_money": m_money,
-                "cum_gap_money": cum_gap_money,
-                "cum_gap_hours": cum_gap_hours,
-                "workdays": workdays,
-                "daily_req": daily_req,
-                "is_overdue": is_overdue
-            }
-            analyzed_stages.append(stage_info)
-            if not is_overdue and daily_req > max_daily_req:
-                max_daily_req = daily_req
-                bottleneck_stage = stage_info
-
-        if not bottleneck_stage and analyzed_stages:
-            bottleneck_stage = analyzed_stages[0]
-
-        text += (
-            "─────────────────\n"
-            "🛡️ **【核心宗旨：节点100%全覆盖 · 严格控制工作区间 5.0h ~ 8.0h】**:\n"
-        )
-
         MIN_DAILY_FLOOR = 5.0
 
-        if max_daily_req <= 0:
-            text += f"🎉 **太棒了！现有资金已完全覆盖所有节点目标！建议非紧急期保持每天工作 {MIN_DAILY_FLOOR:.1f} 小时下限积累资金。**\n"
-        else:
-            recommended_hours = max_daily_req
-            if recommended_hours > 8.0:
-                try:
-                    target_dt = datetime.strptime(bottleneck_stage['date'], "%Y-%m-%d").date()
-                    total_days_with_weekends = calculate_workdays(today, target_dt, off_date_set, include_weekends=True, extra_work_dates=extra_work_set)
-                    weekend_relief_hours = (bottleneck_stage['cum_gap_hours'] / total_days_with_weekends) if total_days_with_weekends > 0 else recommended_hours
-                except Exception:
-                    weekend_relief_hours = recommended_hours
-
-                warning_box = (
-                    f"🚨 **【严重超载预警：工作日工作已超每天 8 小时上限！】**\n"
-                    f"若仅在周一至周五工作，到【{bottleneck_stage['title']}】每天需干 **`{recommended_hours:.1f}` 小时**（已破8小时上限）！\n\n"
-                    f"💡 **【执行方案：启动周末分摊机制】**:\n"
-                    f"为坚守每天不超过 8 小时，建议点击下方【🏖️ 请假与周末开工日历】将周末设为加班日（若全开共 `{total_days_with_weekends}` 天），每天工时立刻降至: **`{weekend_relief_hours:.1f}` 小时/天**！\n"
-                )
-            elif recommended_hours >= MIN_DAILY_FLOOR:
-                intensity_name = "中高强度攻坚期" if recommended_hours > 6.0 else "平稳健康期"
-                warning_box = f"⚡ **【{intensity_name}】** 每日需工作 `{recommended_hours:.1f}` 小时（位于 5.0h 下限 ~ 8.0h 上限内），请保持专注！\n"
-            else:
-                warning_box = f"🟢 **【非紧急储备期】** 节点实际仅需 `{recommended_hours:.1f}h/天`，**建议保持下限 `{MIN_DAILY_FLOOR:.1f} 小时/天`**，提前储备资金！\n"
-
-            effective_display_hours = max(MIN_DAILY_FLOOR, recommended_hours)
-            text += (
-                f"🎯 **当前决定性节点:【{bottleneck_stage['title']}】**\n"
-                f"   └ 截止日期: `{bottleneck_stage['date']}` (扣除周末与请假剩 `{bottleneck_stage['workdays']}` 工作日)\n"
-                f"   └ 扣减总资金后净缺口: `{fx.format_dual_currency(bottleneck_stage['cum_gap_money'], rates)}` (`{bottleneck_stage['cum_gap_hours']:.1f}h`)\n"
-                f"   👉 **当前建议工时: 每天工作 `{effective_display_hours:.1f}` 小时** (工作区间 5.0h~8.0h)\n"
-                f"   💡 *(说明: 此工时仅为今天至 `{bottleneck_stage['date']}` 攻坚期要求，攻克后日常工时降至 5.0h 下限)*\n\n"
-                f"{warning_box}\n"
-            )
-
-        # 阶段区间衔接与真实工时防护 (全量列出所有区间)
+        # 按日期聚合节点目标，支持多阶段精准瓶颈推算
         date_groups = {}
         for m in milestones:
             d_obj = parse_date_safely(m['target_date'])
@@ -373,27 +291,104 @@ def format_overview(chat_id: int) -> str:
             date_groups[d_str]["total_money"] += m['target_money']
 
         sorted_dates = sorted(date_groups.keys(), key=lambda d: parse_date_safely(d))
-        bottleneck_dt_str = bottleneck_stage['date'] if bottleneck_stage else ""
-        b_dt = parse_date_safely(bottleneck_dt_str)
 
-        dates_after = [d for d in sorted_dates if parse_date_safely(d) > b_dt]
-        post_bottleneck_pace = MIN_DAILY_FLOOR
-        if dates_after:
-            start_post = b_dt + timedelta(days=1)
-            w_to_b = calculate_workdays(today, b_dt, off_date_set, extra_work_dates=extra_work_set)
-            cash_at_b = max(0.0, balance + (w_to_b * max_daily_req * rate) - sum(date_groups[d]['total_money'] for d in sorted_dates if parse_date_safely(d) <= b_dt))
-            cum_post_m = 0.0
-            raw_post_pace = 0.0
-            for d in dates_after:
-                grp = date_groups[d]
-                cum_post_m += grp['total_money']
-                gap_post = max(0.0, cum_post_m - cash_at_b)
-                gap_post_h = gap_post / rate
-                w_post = calculate_workdays(start_post, grp['dt'], off_date_set, extra_work_dates=extra_work_set)
-                r_post = gap_post_h / w_post if w_post > 0 else 0
-                if r_post > raw_post_pace:
-                    raw_post_pace = r_post
-            post_bottleneck_pace = max(MIN_DAILY_FLOOR, raw_post_pace)
+        # 核心算法：多阶段动态瓶颈推算（Multi-Phase Piecewise Bottleneck Scheduling）
+        overdue_money = sum(date_groups[d]["total_money"] for d in sorted_dates if parse_date_safely(d) < today)
+        remaining_dates = [d for d in sorted_dates if parse_date_safely(d) >= today]
+        phase_start_dt = today
+        phase_start_cash = max(0.0, balance - overdue_money)
+        initial_uncovered_overdue = max(0.0, overdue_money - balance)
+
+        date_pace_map = {}
+        phases = []
+
+        while remaining_dates:
+            best_pace = 0.0
+            best_idx = 0
+            cum_m = initial_uncovered_overdue if not phases else 0.0
+            for idx, d_str in enumerate(remaining_dates):
+                grp = date_groups[d_str]
+                cum_m += grp['total_money']
+                gap_m = max(0.0, cum_m - phase_start_cash)
+                gap_h = (gap_m / rate) if rate > 0 else 0.0
+                start_calc = phase_start_dt if phase_start_dt == today else (phase_start_dt + timedelta(days=1))
+                w = calculate_workdays(start_calc, grp['dt'], off_date_set, extra_work_dates=extra_work_set)
+                req = (gap_h / w) if w > 0 else 0.0
+                if req > best_pace or idx == 0:
+                    best_pace = max(best_pace, req)
+                    best_idx = idx
+
+            chosen_pace = max(MIN_DAILY_FLOOR, best_pace)
+            bottleneck_d = remaining_dates[best_idx]
+            phase_dates = remaining_dates[:best_idx + 1]
+            phases.append({
+                "bottleneck": bottleneck_d,
+                "pace": chosen_pace,
+                "raw_pace": best_pace,
+                "dates": phase_dates
+            })
+
+            for d_str in phase_dates:
+                date_pace_map[d_str] = chosen_pace
+
+            start_calc = phase_start_dt if phase_start_dt == today else (phase_start_dt + timedelta(days=1))
+            total_w = calculate_workdays(start_calc, date_groups[bottleneck_d]["dt"], off_date_set, extra_work_dates=extra_work_set)
+            total_earned = total_w * chosen_pace * rate
+            total_due = sum(date_groups[d]["total_money"] for d in phase_dates)
+            if not phases[1:]:
+                total_due += initial_uncovered_overdue
+            phase_start_cash = max(0.0, phase_start_cash + total_earned - total_due)
+            phase_start_dt = date_groups[bottleneck_d]["dt"]
+            remaining_dates = remaining_dates[best_idx + 1:]
+
+        text += (
+            "─────────────────\n"
+            "🛡️ **【核心宗旨：节点100%全覆盖 · 严格控制工作区间 5.0h ~ 8.0h】**:\n"
+        )
+
+        p1 = phases[0] if phases else None
+        p1_b_date = p1["bottleneck"] if p1 else ""
+        p1_grp = date_groups.get(p1_b_date)
+        p1_title = " + ".join(p1_grp["titles"]) if p1_grp else ""
+        p1_w = calculate_workdays(today, p1_grp["dt"], off_date_set, extra_work_dates=extra_work_set) if p1_grp else 0
+        p1_cum_m = sum(date_groups[d]["total_money"] for d in sorted_dates if parse_date_safely(d) <= p1_grp["dt"]) if p1_grp else 0.0
+        p1_net_gap_m = max(0.0, p1_cum_m - balance)
+        p1_net_gap_h = (p1_net_gap_m / rate) if rate > 0 else 0.0
+
+        p1_raw_pace = p1["raw_pace"] if p1 else 0.0
+        p1_display_pace = p1["pace"] if p1 else MIN_DAILY_FLOOR
+
+        if p1_raw_pace <= 0:
+            text += f"🎉 **太棒了！现有资金已完全覆盖所有节点目标！建议非紧急期保持每天工作 {MIN_DAILY_FLOOR:.1f} 小时下限积累资金。**\n\n"
+        else:
+            subsequent_note = f"攻克后日常工时降至 {MIN_DAILY_FLOOR:.1f}h 下限"
+            if len(phases) > 1:
+                next_p = phases[1]
+                subsequent_note = f"攻克后下一阶段（至 {next_p['bottleneck']}）日需 `{next_p['pace']:.1f}h/天`"
+
+            if round(p1_raw_pace, 1) > 8.0:
+                total_days_all = calculate_workdays(today, p1_grp["dt"], off_date_set, include_weekends=True, extra_work_dates=extra_work_set)
+                weekend_relief_hours = (p1_net_gap_h / total_days_all) if total_days_all > 0 else p1_raw_pace
+                warning_box = (
+                    f"🚨 **【严重超载预警：工作日工作已超每天 8 小时上限！】**\n"
+                    f"按当前日历排班（剩 `{p1_w}` 工作日），到【{p1_title}】每天需干 **`{p1_raw_pace:.1f}` 小时**（已破8小时上限）！\n\n"
+                    f"💡 **【执行方案：启动周末分摊机制】**:\n"
+                    f"为坚守每天不超过 8 小时，建议点击下方【🏖️ 请假与周末开工日历】将更多周末设为加班日（若全开共 `{total_days_all}` 天），每天工时降至: **`{weekend_relief_hours:.1f}` 小时/天**！\n"
+                )
+            elif round(p1_raw_pace, 1) >= MIN_DAILY_FLOOR:
+                intensity_name = "中高强度攻坚期" if p1_raw_pace > 6.0 else "平稳健康期"
+                warning_box = f"⚡ **【{intensity_name}】** 每日需工作 `{p1_raw_pace:.1f}` 小时（位于 5.0h 下限 ~ 8.0h 上限内），请保持专注！\n"
+            else:
+                warning_box = f"🟢 **【非紧急储备期】** 节点实际仅需 `{p1_raw_pace:.1f}h/天`，**建议保持下限 `{MIN_DAILY_FLOOR:.1f} 小时/天`**，提前储备资金！\n"
+
+            text += (
+                f"🎯 **当前决定性节点:【{p1_title}】**\n"
+                f"   └ 截止日期: `{p1_b_date}` (扣除周末与请假剩 `{p1_w}` 工作日)\n"
+                f"   └ 扣减总资金后净缺口: `{fx.format_dual_currency(p1_net_gap_m, rates)}` (`{p1_net_gap_h:.1f}h`)\n"
+                f"   👉 **当前建议工时: 每天工作 `{p1_display_pace:.1f}` 小时** (工作区间 5.0h~8.0h)\n"
+                f"   💡 *(说明: 此工时仅为今天至 `{p1_b_date}` 攻坚期要求；{subsequent_note})*\n\n"
+                f"{warning_box}\n"
+            )
 
         interval_lines = []
         cur_cash = balance
@@ -412,32 +407,22 @@ def format_overview(chat_id: int) -> str:
                 prev_name = "今天" if prev_d == today else prev_d.strftime("%m-%d")
                 curr_name = d_dt.strftime("%m-%d")
 
-                if d_dt <= b_dt:
-                    pace_hours = max_daily_req if max_daily_req > 0 else MIN_DAILY_FLOOR
-                    earned_in_interval = int_workdays * pace_hours * rate
-                    avail_money = cur_cash + earned_in_interval
-                    due_money = grp["total_money"]
-                    surplus = avail_money - due_money
-                    cur_cash = max(0.0, surplus)
+                pace_hours = date_pace_map.get(d_str, MIN_DAILY_FLOOR)
+                earned_in_interval = int_workdays * pace_hours * rate
+                avail_money = cur_cash + earned_in_interval
+                due_money = grp["total_money"]
+                surplus = avail_money - due_money
+                cur_cash = max(0.0, surplus)
 
-                    if pace_hours > 8.0:
-                        interval_lines.append(f"• 🚨 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{pace_hours:.1f}h/天`(超8h)！")
-                    else:
-                        surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else "，全额达成"
-                        interval_lines.append(f"• 🔥攻坚期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{pace_hours:.1f}h/天`{surplus_str}")
+                surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else "，全额达成"
+                rounded_pace = round(pace_hours, 1)
+
+                if rounded_pace > 8.0:
+                    interval_lines.append(f"• 🚨 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`(超8h)！{surplus_str}")
+                elif rounded_pace > 6.0:
+                    interval_lines.append(f"• 🔥攻坚期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{surplus_str}")
                 else:
-                    pace_hours = post_bottleneck_pace if post_bottleneck_pace > 0 else MIN_DAILY_FLOOR
-                    earned_in_interval = int_workdays * pace_hours * rate
-                    avail_money = cur_cash + earned_in_interval
-                    due_money = grp["total_money"]
-                    surplus = avail_money - due_money
-                    cur_cash = max(0.0, surplus)
-
-                    if pace_hours > 8.0:
-                        interval_lines.append(f"• 🚨 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 日需 `{pace_hours:.1f}h/天`(超8h)！")
-                    else:
-                        surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else "，全额达成"
-                        interval_lines.append(f"• 🟢平稳期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): `{pace_hours:.1f}h/天`{surplus_str}")
+                    interval_lines.append(f"• 🟢平稳期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{surplus_str}")
                 prev_d = d_dt
             except Exception:
                 pass
