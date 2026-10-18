@@ -38,6 +38,15 @@ logger = logging.getLogger(__name__)
 # 保存用户当前正在输入的修改状态
 user_states = {}
 
+def is_owner(chat_id: int) -> bool:
+    """验证用户权限。若未配置 OWNER_CHAT_ID 则默认所有私聊用户可用"""
+    if not OWNER_CHAT_ID:
+        return True
+    try:
+        return int(chat_id) == int(OWNER_CHAT_ID)
+    except (ValueError, TypeError):
+        return str(chat_id).strip() == str(OWNER_CHAT_ID).strip()
+
 def get_today() -> date:
     """获取当前配置时区（例如 Europe/Berlin 柏林时间）的实际日期"""
     tz = pytz.timezone(TIMEZONE)
@@ -493,15 +502,20 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """一键备份数据库命令 /backup"""
     chat_id = update.effective_chat.id
     if not is_owner(chat_id):
+        await update.message.reply_text("⛔ 抱歉，仅机器人所有者可执行备份操作。")
         return
     db_path = db.DB_FILE
     if os.path.exists(db_path):
-        with open(db_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename="budget_data.db",
-                caption="📦 **【数据库备份文件】**\n\n云端上线后，直接在 Telegram 中将此文件发送给机器人，即可一键恢复所有预算与阶段目标！"
-            )
+        try:
+            with open(db_path, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename="budget_data.db",
+                    caption="📦 **【数据库备份文件】**\n\n云端上线后，直接在 Telegram 中将此文件发送给机器人，即可一键恢复所有预算与阶段目标！"
+                )
+        except Exception as e:
+            logger.error(f"Failed to send backup document: {e}")
+            await update.message.reply_text(f"❌ 备份文件读取失败: {e}")
     else:
         await update.message.reply_text("⚠️ 数据库文件暂不存在。")
 
@@ -1184,6 +1198,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理用户直接发送的 .db 数据库文件，一键热恢复全部数据"""
     chat_id = update.effective_chat.id
     if not is_owner(chat_id):
+        await update.message.reply_text("⛔ 抱歉，仅机器人所有者可导入恢复数据库。")
         return
     doc = update.message.document
     if not doc:
