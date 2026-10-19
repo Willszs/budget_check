@@ -213,6 +213,34 @@ def update_milestone_date(milestone_id: int, chat_id: int, new_date: str):
     conn.close()
     return title
 
+def update_milestone_money(milestone_id: int, chat_id: int, new_money: float, new_hours: float):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE milestones SET target_money = ?, target_hours = ? WHERE id = ? AND chat_id = ?", (new_money, new_hours, milestone_id, chat_id))
+    cursor.execute("SELECT title FROM milestones WHERE id = ?", (milestone_id,))
+    row = cursor.fetchone()
+    title = row[0] if row else ""
+    conn.commit()
+    conn.close()
+    return title
+
+def get_milestone(milestone_id: int, chat_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, title, target_date, target_hours, target_money, status FROM milestones WHERE id = ? AND chat_id = ?", (milestone_id, chat_id))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0],
+            "title": row[1],
+            "target_date": row[2],
+            "target_hours": row[3],
+            "target_money": row[4],
+            "status": row[5]
+        }
+    return None
+
 def complete_milestone(milestone_id: int, chat_id: int):
     """完成节点：标记状态为 completed，并自动从总资金中扣除该节点的金额"""
     conn = sqlite3.connect(DB_FILE)

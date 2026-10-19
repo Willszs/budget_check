@@ -694,10 +694,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rates = fx.get_exchange_rates()
         keyboard = []
         for m in paged_ms:
-            money_str = fx.format_dual_currency(m['target_money'], rates)
+            money_val = m['target_money']
+            money_repr = f"€{money_val:.0f}" if money_val == int(money_val) else f"€{money_val:.2f}"
             keyboard.append([
-                InlineKeyboardButton(f"✅ 完成: {m['title']}", callback_data=f"done_m_{m['id']}"),
-                InlineKeyboardButton(f"📅 {m['target_date']}", callback_data=f"editdate_m_{m['id']}"),
+                InlineKeyboardButton(f"✅ 完成: {m['title']}", callback_data=f"done_m_{m['id']}")
+            ])
+            keyboard.append([
+                InlineKeyboardButton(f"💰 金额: {money_repr}", callback_data=f"editmoney_m_{m['id']}"),
+                InlineKeyboardButton(f"📅 截止: {m['target_date']}", callback_data=f"editdate_m_{m['id']}"),
                 InlineKeyboardButton("🗑️ 删除", callback_data=f"del_m_{m['id']}")
             ])
 
@@ -713,9 +717,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await safe_edit_message(
             query,
-            f"📋 **阶段节点管理 (共 {len(milestones)} 项 · 第 {page + 1}/{total_pages} 页)**：\n点击即可完成、修改截止日期或删除对应节点：",
+            f"📋 **阶段节点管理 (共 {len(milestones)} 项 · 第 {page + 1}/{total_pages} 页)**：\n点击即可标记完成、修改目标金额、修改截止日期或删除：",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+
+    elif data.startswith("editmoney_m_"):
+        m_id = int(data.replace("editmoney_m_", ""))
+        milestones = db.get_milestones(chat_id, status="pending")
+        target_m = next((m for m in milestones if m["id"] == m_id), None)
+        if not target_m:
+            await query.answer("⚠️ 未找到该阶段节点", show_alert=True)
+            return
+
+        user_states[chat_id] = {
+            "action": "edit_milestone_money_input",
+            "milestone_id": m_id,
+            "title": target_m["title"]
+        }
+        rates = fx.get_exchange_rates()
+        curr_money_str = fx.format_dual_currency(target_m["target_money"], rates)
+        prompt = (
+            f"💰 **修改节点目标金额**\n\n"
+            f"当前节点: 【**{target_m['title']}**】\n"
+            f"当前设定金额: `{curr_money_str}` (`{target_m['target_hours']:.1f}h`)\n\n"
+            f"✍️ 请直接回复输入 **新的金额或工时**：\n"
+            f"- 例如输入欧元：`800`、`800欧`、`€800`\n"
+            f"- 例如输入人民币：`6000元`、`¥6000`\n"
+            f"- 例如输入工时：`40h` 或 `40小时`\n\n"
+            f"输入后系统会自动重新换算并重新测算所有排班！"
+        )
+        await safe_edit_message(query, prompt, reply_markup=cancel_btn)
     
     elif data.startswith("editdate_m_"):
         m_id = int(data.replace("editdate_m_", ""))
@@ -1016,6 +1047,38 @@ def parse_direct_command(text: str, chat_id: int) -> tuple[bool, str]:
                 db.add_work_day(chat_id, clean_cal, "文字记录")
                 return True, f"💼 已将 `{clean_cal}` 设为周末加班开工日！"
 
+    # 8. 修改节点金额: 改金额 学费 800欧 / 修改金额 还爸妈钱 1500元 / 学费 改为 800欧
+    m_mod = re.match(r"^(?:改金额|修改金额|调整金额|改钱)\s+(.+)\s+(.+)$", t)
+    if not m_mod:
+        m_mod = re.match(r"^(.+)\s+(?:改为|改成|调整为|变更为|改金额为?)\s+(.+)$", t)
+    if m_mod:
+        kw = m_mod.group(1).strip()
+        amt_str = m_mod.group(2).strip()
+        milestones = db.get_milestones(chat_id, status="pending")
+        matched = [m for m in milestones if kw.lower() in m["title"].lower() or m["title"].lower() in kw.lower()]
+        if matched:
+            target = matched[0]
+            profile = db.get_profile(chat_id)
+            rate = profile["hourly_rate"] if profile else 0.0
+            try:
+                if amt_str.lower().endswith("h") or amt_str.endswith("小时"):
+                    clean_h = amt_str.lower().replace("h", "").replace("小时", "").strip()
+                    hours = float(clean_h)
+                    if hours < 0:
+                        return True, "❌ 工时不能为负数。"
+                    money_eur = hours * rate
+                else:
+                    money_eur, _ = fx.parse_currency_input(amt_str, rates)
+                    if money_eur < 0:
+                        return True, "❌ 金额不能为负数。"
+                    hours = (money_eur / rate) if rate > 0 else 0.0
+
+                title = db.update_milestone_money(target["id"], chat_id, money_eur, hours)
+                money_dual = fx.format_dual_currency(money_eur, rates)
+                return True, f"✅ 已成功将【**{title}**】目标金额更新为 `{money_dual}` (`{hours:.1f}h`)！"
+            except Exception:
+                return True, f"❌ 金额解析失败，请输入有效金额（例如 `改金额 {kw} 800欧`）。"
+
     return False, ""
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1050,6 +1113,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• **记一笔支出**：直接发送 `-50欧`、`-200元` 或 `支出 100`\n"
             "• **更新总资金**：发送 `资金 5000` 或 `总资金 50000元`\n"
             "• **更新时薪**：发送 `时薪 20` 或 `时薪 25刀`\n"
+            "• **修改节点金额**：发送 `改金额 学费 800欧` 或 `学费 改为 5000元`\n"
             "• **完成节点**：发送 `完成 健身卡` 或 `搞定 兼职项目`\n"
             "• **添加节点**：发送 `买电脑 1200欧 12-01` 或 `租房 800欧 2026-11-01`\n"
             "• **请假/加班**：发送 `请假 10-25` 或 `加班 10-18`\n\n"
@@ -1178,6 +1242,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "`进修课程 650欧` 或 `数码设备 800元` 或 `设计项目 20h`\n"
                 "发送后会直接弹出日历供您点击选择截止日期！"
             )
+
+    elif action == "edit_milestone_money_input":
+        m_id = state.get("milestone_id")
+        title = state.get("title", "该节点")
+        profile = db.get_profile(chat_id)
+        rate = profile["hourly_rate"] if profile else 0.0
+
+        try:
+            clean_text = text.strip()
+            if clean_text.lower().endswith("h") or clean_text.endswith("小时"):
+                clean_h = clean_text.lower().replace("h", "").replace("小时", "").strip()
+                hours = float(clean_h)
+                if hours < 0:
+                    raise ValueError("工时不能为负数")
+                money_eur = hours * rate
+            else:
+                money_eur, _ = fx.parse_currency_input(clean_text, rates)
+                if money_eur < 0:
+                    raise ValueError("金额不能为负数")
+                hours = (money_eur / rate) if rate > 0 else 0.0
+
+            db.update_milestone_money(m_id, chat_id, money_eur, hours)
+            user_states.pop(chat_id, None)
+
+            money_dual = fx.format_dual_currency(money_eur, rates)
+            res_text = (
+                f"✅ **成功修改节点目标金额！**\n\n"
+                f"📌 节点: 【**{title}**】\n"
+                f"💰 最新目标金额: `{money_dual}` (`{hours:.1f}h`)\n\n"
+            ) + format_overview(chat_id)
+            await update.message.reply_text(res_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
+        except ValueError:
+            await update.message.reply_text("❌ 输入格式错误，请输入有效的金额或工时（支持带元/欧/刀/h）：")
 
     elif action == "add_off_days_input":
         # 支持: 2026-10-14 生日 或 2026-10-15~2026-10-18 旅行
