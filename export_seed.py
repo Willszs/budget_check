@@ -15,7 +15,7 @@ def generate_seed() -> str:
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
-    c.execute("SELECT chat_id, current_balance, target_amount, hourly_rate, updated_at FROM user_profile")
+    c.execute("SELECT chat_id, current_balance, target_amount, hourly_rate, updated_at, fixed_salary, fixed_salary_start, fixed_salary_day FROM user_profile")
     user_profile = [dict(r) for r in c.fetchall()]
 
     c.execute("SELECT id, chat_id, title, target_date, target_hours, target_money, status, created_at FROM milestones")

@@ -22,9 +22,18 @@ def restore_from_seed(seed_str: str) -> bool:
             cursor.execute("DELETE FROM user_profile")
             for r in data["user_profile"]:
                 cursor.execute("""
-                INSERT OR REPLACE INTO user_profile (chat_id, current_balance, target_amount, hourly_rate, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                """, (r["chat_id"], r["current_balance"], r["target_amount"], r["hourly_rate"], r["updated_at"]))
+                INSERT OR REPLACE INTO user_profile (chat_id, current_balance, target_amount, hourly_rate, updated_at, fixed_salary, fixed_salary_start, fixed_salary_day)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    r["chat_id"],
+                    r["current_balance"],
+                    r["target_amount"],
+                    r["hourly_rate"],
+                    r["updated_at"],
+                    r.get("fixed_salary", 0.0),
+                    r.get("fixed_salary_start", ""),
+                    r.get("fixed_salary_day", 1)
+                ))
         if "milestones" in data:
             cursor.execute("DELETE FROM milestones")
             for r in data["milestones"]:
@@ -64,9 +73,26 @@ def init_db():
         current_balance REAL DEFAULT 0.0,
         target_amount REAL DEFAULT 0.0,
         hourly_rate REAL DEFAULT 0.0,
-        updated_at TEXT
+        updated_at TEXT,
+        fixed_salary REAL DEFAULT 0.0,
+        fixed_salary_start TEXT DEFAULT '',
+        fixed_salary_day INTEGER DEFAULT 1
     )
     """)
+
+    # 自动升级表结构：若旧表缺少新字段则追加
+    try:
+        cursor.execute("ALTER TABLE user_profile ADD COLUMN fixed_salary REAL DEFAULT 0.0")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE user_profile ADD COLUMN fixed_salary_start TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE user_profile ADD COLUMN fixed_salary_day INTEGER DEFAULT 1")
+    except Exception:
+        pass
 
     # 阶段目标节点表（模式B：截止日期、目标工时、目标金额、说明、是否完成）
     cursor.execute("""
@@ -120,18 +146,24 @@ def init_db():
 def get_profile(chat_id: int):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT current_balance, target_amount, hourly_rate FROM user_profile WHERE chat_id = ?", (chat_id,))
+    cursor.execute("""
+    SELECT current_balance, target_amount, hourly_rate, fixed_salary, fixed_salary_start, fixed_salary_day 
+    FROM user_profile WHERE chat_id = ?
+    """, (chat_id,))
     row = cursor.fetchone()
     conn.close()
     if row:
         return {
             "current_balance": row[0],
             "target_amount": row[1],
-            "hourly_rate": row[2]
+            "hourly_rate": row[2],
+            "fixed_salary": row[3] if row[3] is not None else 0.0,
+            "fixed_salary_start": row[4] if row[4] is not None else "",
+            "fixed_salary_day": row[5] if row[5] is not None else 1
         }
     return None
 
-def update_profile(chat_id: int, current_balance=None, target_amount=None, hourly_rate=None):
+def update_profile(chat_id: int, current_balance=None, target_amount=None, hourly_rate=None, fixed_salary=None, fixed_salary_start=None, fixed_salary_day=None):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     now_str = datetime.now().isoformat()
@@ -139,24 +171,30 @@ def update_profile(chat_id: int, current_balance=None, target_amount=None, hourl
     profile = get_profile(chat_id)
     if not profile:
         cursor.execute("""
-        INSERT INTO user_profile (chat_id, current_balance, target_amount, hourly_rate, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO user_profile (chat_id, current_balance, target_amount, hourly_rate, updated_at, fixed_salary, fixed_salary_start, fixed_salary_day)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             chat_id,
             current_balance if current_balance is not None else 0.0,
             target_amount if target_amount is not None else 0.0,
             hourly_rate if hourly_rate is not None else 0.0,
-            now_str
+            now_str,
+            fixed_salary if fixed_salary is not None else 0.0,
+            fixed_salary_start if fixed_salary_start is not None else "",
+            fixed_salary_day if fixed_salary_day is not None else 1
         ))
     else:
         new_balance = current_balance if current_balance is not None else profile["current_balance"]
         new_target = target_amount if target_amount is not None else profile["target_amount"]
         new_rate = hourly_rate if hourly_rate is not None else profile["hourly_rate"]
+        new_fixed_salary = fixed_salary if fixed_salary is not None else profile.get("fixed_salary", 0.0)
+        new_fixed_start = fixed_salary_start if fixed_salary_start is not None else profile.get("fixed_salary_start", "")
+        new_fixed_day = fixed_salary_day if fixed_salary_day is not None else profile.get("fixed_salary_day", 1)
         cursor.execute("""
         UPDATE user_profile
-        SET current_balance = ?, target_amount = ?, hourly_rate = ?, updated_at = ?
+        SET current_balance = ?, target_amount = ?, hourly_rate = ?, updated_at = ?, fixed_salary = ?, fixed_salary_start = ?, fixed_salary_day = ?
         WHERE chat_id = ?
-        """, (new_balance, new_target, new_rate, now_str, chat_id))
+        """, (new_balance, new_target, new_rate, now_str, new_fixed_salary, new_fixed_start, new_fixed_day, chat_id))
         
     conn.commit()
     conn.close()
