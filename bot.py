@@ -254,6 +254,62 @@ def parse_fixed_expense_input(text: str, rates: dict):
     start_date = f"{today.year:04d}-{today.month:02d}-01"
     return title, val_eur, pay_day, start_date, end_date
 
+def parse_edit_fixed_expense_input(text: str, rates: dict):
+    """智能解析用户修改固定支出的内容（支持单独或组合修改：每月金额、每月扣款日、到期结束月份或设为长期）"""
+    t = text.strip()
+    today = get_today()
+
+    new_amount = None
+    new_pay_day = None
+    new_end_date = None
+
+    # 1. 检查是否设置为长期有效
+    if re.search(r"(长期|无期限|一直|永久|取消期限|取消到期)", t):
+        new_end_date = ""
+        t = re.sub(r"(长期有效|长期|无期限|一直|永久|取消期限|取消到期)", " ", t)
+
+    # 2. 提取截止期限 (e.g. 到2027-03结束, 至2027-02, 2027-03到期, 2027-03, 到3月结束)
+    m_end_ymd = re.search(r"(?:到|至|截止到?|期限)?\s*(20\d{2})[-/](\d{1,2})(?:[-/](\d{1,2}))?\s*(?:结束|到期|截止|为止)?", t)
+    if m_end_ymd and 1 <= int(m_end_ymd.group(2)) <= 12:
+        ey = int(m_end_ymd.group(1))
+        em = int(m_end_ymd.group(2))
+        _, max_ed = calendar.monthrange(ey, em)
+        if m_end_ymd.group(3):
+            ed = min(max_ed, max(1, int(m_end_ymd.group(3))))
+        else:
+            ed = max_ed
+        new_end_date = f"{ey:04d}-{em:02d}-{ed:02d}"
+        t = t[:m_end_ymd.start()] + " " + t[m_end_ymd.end():]
+    else:
+        m_end_m = re.search(r"(?:到|至|截止到?)\s*(?:明年)?\s*(\d{1,2})\s*月(?:\s*(?:份|底|结束|到期|截止|为止))?", t)
+        if m_end_m and 1 <= int(m_end_m.group(1)) <= 12:
+            em = int(m_end_m.group(1))
+            ey = today.year if em >= today.month else today.year + 1
+            _, ed = calendar.monthrange(ey, em)
+            new_end_date = f"{ey:04d}-{em:02d}-{ed:02d}"
+            t = t[:m_end_m.start()] + " " + t[m_end_m.end():]
+
+    # 3. 提取每月扣款日 (e.g. 每月6号, 每月30日, 6号, 30日)
+    m_day = re.search(r"(?:每月)?\s*(\d{1,2})\s*[日号](?:扣款|到账|交)?", t)
+    if m_day and 1 <= int(m_day.group(1)) <= 31:
+        new_pay_day = int(m_day.group(1))
+        t = t[:m_day.start()] + " " + t[m_day.end():]
+
+    # 4. 提取金额 (e.g. 1000欧, 600, €650, 5000元)
+    m_amt = re.search(r"([€$¥]?\s*\d+(?:\.\d+)?\s*(?:欧|eur|euro|元|rmb|cny|块|刀|usd|\$|€|¥)?)", t, re.I)
+    if m_amt:
+        amt_str = m_amt.group(1).strip()
+        try:
+            val_eur, _ = fx.parse_currency_input(amt_str, rates)
+            if val_eur > 0:
+                new_amount = val_eur
+        except Exception:
+            pass
+
+    if new_amount is None and new_pay_day is None and new_end_date is None:
+        return None
+    return new_amount, new_pay_day, new_end_date
+
 
 def build_calendar_keyboard(chat_id: int, year: int, month: int):
     """生成带有状态切换的 Telegram 交互式日历组件（主动点选哪一天，哪一天算 Freelancer 工作日）"""
@@ -418,14 +474,16 @@ def build_fixed_expenses_panel(chat_id: int, notice: str = "") -> tuple[str, Inl
         total_m = sum(e["amount"] for e in expenses)
         msg_text = (
             f"{prefix}📉 **【固定每月支出管理】** (共 {len(expenses)} 项 · 合计 `{fx.format_dual_currency(total_m, rates)} /月`)\n\n"
-            "当前生效中的固定支出如下（点击下方按钮可继续删除或新增）：\n\n"
+            "当前生效中的固定支出如下（点击对应按钮可**修改**、**删除**或**新增**）：\n\n"
         )
         for idx, e in enumerate(expenses, 1):
             e_dual = fx.format_dual_currency(e["amount"], rates)
             end_desc = f"至 `{e['end_date'][:7]}` 结束" if e.get("end_date") else "长期有效"
             msg_text += f"{idx}. **{e['title']}**: `{e_dual}/月` (每月 `{e['pay_day']}` 日 | {end_desc})\n"
+            amt_repr = f"€{e['amount']:.0f}" if e["amount"] == int(e["amount"]) else f"€{e['amount']:.2f}"
             keyboard.append([
-                InlineKeyboardButton(f"🗑️ 删除: {e['title']} (€{e['amount']:.0f}/月)", callback_data=f"del_fexp_{e['id']}")
+                InlineKeyboardButton(f"✏️ 修改: {e['title']} ({amt_repr}/月)", callback_data=f"edit_fexp_{e['id']}"),
+                InlineKeyboardButton("🗑️ 删除", callback_data=f"del_fexp_{e['id']}")
             ])
 
     keyboard.append([InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")])
@@ -1292,6 +1350,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         back_to_fexp_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消并返回固定支出列表", callback_data="manage_fixed_expenses")]])
         await safe_edit_message(query, prompt, reply_markup=back_to_fexp_btn)
 
+    elif data.startswith("edit_fexp_"):
+        exp_id = int(data.replace("edit_fexp_", ""))
+        target_exp = db.get_fixed_expense(exp_id, chat_id)
+        if not target_exp:
+            await query.answer("⚠️ 未找到该固定支出项", show_alert=True)
+            return
+
+        user_states[chat_id] = {
+            "action": "edit_fixed_expense_input",
+            "expense_id": exp_id,
+            "title": target_exp["title"]
+        }
+        rates = fx.get_exchange_rates()
+        curr_amt_str = fx.format_dual_currency(target_exp["amount"], rates)
+        curr_end_str = f"至 `{target_exp['end_date'][:7]}` 结束" if target_exp.get("end_date") else "长期有效"
+        prompt = (
+            f"✏️ **修改固定每月支出**\n\n"
+            f"当前项目: 【**{target_exp['title']}**】\n"
+            f"当前每月金额: `{curr_amt_str}/月`\n"
+            f"当前扣款日期: 每月 `{target_exp['pay_day']}` 日\n"
+            f"当前有效期限: {curr_end_str}\n\n"
+            "✍️ 请直接回复要修改的内容（**可单独修改某一项，也可组合修改**）：\n"
+            "• **只改金额**：`700欧` 或 `5000元`\n"
+            "• **只改扣款日**：`每月15号` 或 `15日`\n"
+            "• **只改到期月份**：`到2027-06结束` 或 `长期`\n"
+            "• **同时修改多项**：`800欧 每月15号 到2027-06结束`"
+        )
+        back_to_fexp_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消并返回固定支出列表", callback_data="manage_fixed_expenses")]])
+        await safe_edit_message(query, prompt, reply_markup=back_to_fexp_btn)
+
     elif data == "manage_off_days":
         today = get_today()
         cal_kb = build_calendar_keyboard(chat_id, today.year, today.month)
@@ -1460,6 +1548,29 @@ def parse_direct_command(text: str, chat_id: int) -> tuple[bool, str]:
         target = matched[0]
         del_title = db.delete_fixed_expense(target["id"], chat_id)
         return True, f"🗑️ 已成功删除固定支出【**{del_title}**】！"
+
+    # 5b2. 修改固定支出: 修改固定支出 学费 700欧 每月15号 到2027-06结束
+    m_edit_fexp = re.match(r"^(?:修改|改|调整)(?:固定支出|固定开销)\s+(\S+)\s+(.+)$", t)
+    if m_edit_fexp:
+        kw = m_edit_fexp.group(1).strip()
+        rest_str = m_edit_fexp.group(2).strip()
+        exps = db.get_fixed_expenses(chat_id)
+        matched = [e for e in exps if kw.lower() in e["title"].lower() or e["title"].lower() in kw.lower()]
+        if not matched:
+            return True, f"⚠️ 未找到包含【{kw}】的固定支出项。"
+        target = matched[0]
+        parsed_edit = parse_edit_fixed_expense_input(rest_str, rates)
+        if not parsed_edit:
+            return True, f"❌ 未能识别修改内容，例如发送：`修改固定支出 {target['title']} 700欧 每月15号 到2027-06结束`"
+        new_amt, new_day, new_end = parsed_edit
+        updated = db.update_fixed_expense(target["id"], chat_id, amount=new_amt, pay_day=new_day, end_date=new_end)
+        val_dual = fx.format_dual_currency(updated["amount"], rates)
+        end_desc = f"至 `{updated['end_date'][:7]}` 结束" if updated.get("end_date") else "长期有效"
+        return True, (
+            f"✅ **成功修改固定每月支出**！【**{updated['title']}**】\n"
+            f"💸 最新金额: `{val_dual}/月` (每月 `{updated['pay_day']}` 日)\n"
+            f"📅 最新期限: {end_desc}"
+        )
 
     # 5c. 添加固定支出: 固定支出 房租 1000欧 每月1号 / 固定支出 学费 650欧 30号 到2027-02结束
     if re.match(r"^(?:添加|新增|设置)?(?:固定支出|固定开销|每月支出)\s+", t):
@@ -1700,6 +1811,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         notice = (
             f"🎉 **固定每月支出添加成功！**\n"
             f"📌 项目: 【**{title}**】 | 💸 金额: `{val_dual}/月` (每月 `{pay_day}` 日) | 📅 期限: {end_desc}"
+        )
+        panel_text, panel_kb = build_fixed_expenses_panel(chat_id, notice=notice)
+        await update.message.reply_text(panel_text, reply_markup=panel_kb, parse_mode="Markdown")
+
+    elif action == "edit_fixed_expense_input":
+        exp_id = state.get("expense_id")
+        parsed_edit = parse_edit_fixed_expense_input(text, rates)
+        if not parsed_edit:
+            await update.message.reply_text(
+                "❌ 未能识别要修改的金额、扣款日或到期月份，请重新输入！\n"
+                "例如：`700欧`、`每月15号`、`到2027-06结束`、`长期` 或 `700欧 每月15号 到2027-06结束`"
+            )
+            return
+        new_amt, new_day, new_end = parsed_edit
+        updated = db.update_fixed_expense(exp_id, chat_id, amount=new_amt, pay_day=new_day, end_date=new_end)
+        user_states.pop(chat_id, None)
+
+        if not updated:
+            panel_text, panel_kb = build_fixed_expenses_panel(chat_id, notice="⚠️ 未找到该固定支出项。")
+            await update.message.reply_text(panel_text, reply_markup=panel_kb, parse_mode="Markdown")
+            return
+
+        val_dual = fx.format_dual_currency(updated["amount"], rates)
+        end_desc = f"至 `{updated['end_date'][:7]}` 结束（到期自动停扣）" if updated.get("end_date") else "长期有效"
+        notice = (
+            f"✅ **固定每月支出修改成功！**\n"
+            f"📌 项目: 【**{updated['title']}**】 | 💸 最新金额: `{val_dual}/月` (每月 `{updated['pay_day']}` 日) | 📅 期限: {end_desc}"
         )
         panel_text, panel_kb = build_fixed_expenses_panel(chat_id, notice=notice)
         await update.message.reply_text(panel_text, reply_markup=panel_kb, parse_mode="Markdown")

@@ -433,6 +433,52 @@ def delete_fixed_expense(expense_id: int, chat_id: int):
     conn.close()
     return title
 
+def get_fixed_expense(expense_id: int, chat_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, title, amount, pay_day, start_date, end_date
+    FROM fixed_expenses WHERE id = ? AND chat_id = ?
+    """, (expense_id, chat_id))
+    r = cursor.fetchone()
+    conn.close()
+    if r:
+        return {
+            "id": r[0],
+            "title": r[1],
+            "amount": r[2],
+            "pay_day": r[3] if r[3] is not None else 1,
+            "start_date": r[4] if r[4] is not None else "",
+            "end_date": r[5] if r[5] is not None else ""
+        }
+    return None
+
+def update_fixed_expense(expense_id: int, chat_id: int, title=None, amount=None, pay_day=None, end_date=None):
+    exp = get_fixed_expense(expense_id, chat_id)
+    if not exp:
+        return None
+    new_title = title if title is not None else exp["title"]
+    new_amount = amount if amount is not None else exp["amount"]
+    new_pay_day = pay_day if pay_day is not None else exp["pay_day"]
+    new_end_date = end_date if end_date is not None else exp["end_date"]
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE fixed_expenses
+    SET title = ?, amount = ?, pay_day = ?, end_date = ?
+    WHERE id = ? AND chat_id = ?
+    """, (new_title, new_amount, new_pay_day, new_end_date, expense_id, chat_id))
+    conn.commit()
+    conn.close()
+    return {
+        "id": expense_id,
+        "title": new_title,
+        "amount": new_amount,
+        "pay_day": new_pay_day,
+        "end_date": new_end_date
+    }
+
 
 
 
