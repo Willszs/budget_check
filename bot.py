@@ -313,7 +313,7 @@ def build_calendar_keyboard(chat_id: int, year: int, month: int):
 
     return InlineKeyboardMarkup(keyboard)
 
-def build_datepicker_keyboard(year: int, month: int, prefix: str = "mspick", extra_id: int = 0):
+def build_datepicker_keyboard(year: int, month: int, prefix: str = "mspick", extra_id: int = 0, return_cb: str = "refresh", return_text: str = "🔙 取消并返回看板"):
     """通用的交互式日历日期选择器组件"""
     keyboard = []
     prev_y, prev_m = (year, month - 1) if month > 1 else (year - 1, 12)
@@ -346,9 +346,90 @@ def build_datepicker_keyboard(year: int, month: int, prefix: str = "mspick", ext
         keyboard.append(row)
 
     keyboard.append([
-        InlineKeyboardButton("🔙 取消并返回看板", callback_data="refresh")
+        InlineKeyboardButton(return_text, callback_data=return_cb)
     ])
     return InlineKeyboardMarkup(keyboard)
+
+def build_milestone_list_panel(chat_id: int, page: int = 0, notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    """构建【阶段节点管理】次面板文本与键盘，操作后停留在当前页，由用户自行选择是否返回主看板"""
+    milestones = db.get_milestones(chat_id, status="pending")
+    prefix = f"{notice}\n\n" if notice else ""
+    if not milestones:
+        text = f"{prefix}📋 **【阶段节点管理】**\n\n当前没有进行中的阶段节点！"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ 添加阶段节点", callback_data="add_milestone")],
+            [InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")]
+        ])
+        return text, kb
+
+    milestones = sorted(milestones, key=lambda x: parse_date_safely(x['target_date']))
+    page_size = 5
+    total_pages = (len(milestones) + page_size - 1) // page_size
+    page = max(0, min(page, total_pages - 1))
+    paged_ms = milestones[page * page_size : (page + 1) * page_size]
+
+    keyboard = []
+    for m in paged_ms:
+        money_val = m['target_money']
+        money_repr = f"€{money_val:.0f}" if money_val == int(money_val) else f"€{money_val:.2f}"
+        keyboard.append([
+            InlineKeyboardButton(f"✅ 完成: {m['title']}", callback_data=f"done_m_{m['id']}_{page}")
+        ])
+        keyboard.append([
+            InlineKeyboardButton(f"💰 金额: {money_repr}", callback_data=f"editmoney_m_{m['id']}_{page}"),
+            InlineKeyboardButton(f"📅 截止: {m['target_date']}", callback_data=f"editdate_m_{m['id']}_{page}"),
+            InlineKeyboardButton("🗑️ 删除", callback_data=f"del_m_{m['id']}_{page}")
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️ 上一页", callback_data=f"list_m_page_{page - 1}"))
+    nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages} 页", callback_data="cal_ignore"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("下一页 ▶️", callback_data=f"list_m_page_{page + 1}"))
+
+    keyboard.append(nav_row)
+    keyboard.append([
+        InlineKeyboardButton("➕ 添加新节点", callback_data="add_milestone"),
+        InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")
+    ])
+
+    text = (
+        f"{prefix}📋 **阶段节点管理 (共 {len(milestones)} 项 · 第 {page + 1}/{total_pages} 页)**：\n"
+        "点击即可标记完成、修改目标金额、修改截止日期或删除（操作后将留在此面板）："
+    )
+    return text, InlineKeyboardMarkup(keyboard)
+
+def build_fixed_expenses_panel(chat_id: int, notice: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    """构建【固定每月支出管理】次面板文本与键盘，操作后停留在当前面板"""
+    expenses = db.get_fixed_expenses(chat_id)
+    rates = fx.get_exchange_rates()
+    prefix = f"{notice}\n\n" if notice else ""
+    keyboard = [
+        [InlineKeyboardButton("➕ 添加一项固定支出", callback_data="add_fixed_expense")]
+    ]
+    if not expenses:
+        msg_text = (
+            f"{prefix}📉 **【固定每月支出管理】**\n\n"
+            "当前暂未设置任何固定每月支出（如房租、生活费、学费、分期还款等）。\n\n"
+            "💡 设置后，系统会自动在每个月的对应日期扣减该支出（支持设置**到期结束月份**，到期后自动停止），无需再每个月手动新建重复的阶段节点！"
+        )
+    else:
+        total_m = sum(e["amount"] for e in expenses)
+        msg_text = (
+            f"{prefix}📉 **【固定每月支出管理】** (共 {len(expenses)} 项 · 合计 `{fx.format_dual_currency(total_m, rates)} /月`)\n\n"
+            "当前生效中的固定支出如下（点击下方按钮可继续删除或新增）：\n\n"
+        )
+        for idx, e in enumerate(expenses, 1):
+            e_dual = fx.format_dual_currency(e["amount"], rates)
+            end_desc = f"至 `{e['end_date'][:7]}` 结束" if e.get("end_date") else "长期有效"
+            msg_text += f"{idx}. **{e['title']}**: `{e_dual}/月` (每月 `{e['pay_day']}` 日 | {end_desc})\n"
+            keyboard.append([
+                InlineKeyboardButton(f"🗑️ 删除: {e['title']} (€{e['amount']:.0f}/月)", callback_data=f"del_fexp_{e['id']}")
+            ])
+
+    keyboard.append([InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")])
+    return msg_text, InlineKeyboardMarkup(keyboard)
 
 def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_intervals: bool = False) -> str:
     profile = db.get_profile(chat_id)
@@ -941,53 +1022,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(query, prompt, reply_markup=cancel_btn)
     
     elif data == "list_milestones" or data.startswith("list_m_page_"):
+        user_states.pop(chat_id, None)
         page = int(data.replace("list_m_page_", "")) if data.startswith("list_m_page_") else 0
-        milestones = db.get_milestones(chat_id, status="pending")
-        if not milestones:
-            await safe_edit_message(
-                query,
-                "当前没有进行中的节点！",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回看板", callback_data="refresh")]])
-            )
-            return
-
-        page_size = 5
-        total_pages = (len(milestones) + page_size - 1) // page_size
-        page = max(0, min(page, total_pages - 1))
-        paged_ms = milestones[page * page_size : (page + 1) * page_size]
-
-        rates = fx.get_exchange_rates()
-        keyboard = []
-        for m in paged_ms:
-            money_val = m['target_money']
-            money_repr = f"€{money_val:.0f}" if money_val == int(money_val) else f"€{money_val:.2f}"
-            keyboard.append([
-                InlineKeyboardButton(f"✅ 完成: {m['title']}", callback_data=f"done_m_{m['id']}")
-            ])
-            keyboard.append([
-                InlineKeyboardButton(f"💰 金额: {money_repr}", callback_data=f"editmoney_m_{m['id']}"),
-                InlineKeyboardButton(f"📅 截止: {m['target_date']}", callback_data=f"editdate_m_{m['id']}"),
-                InlineKeyboardButton("🗑️ 删除", callback_data=f"del_m_{m['id']}")
-            ])
-
-        nav_row = []
-        if page > 0:
-            nav_row.append(InlineKeyboardButton("◀️ 上一页", callback_data=f"list_m_page_{page - 1}"))
-        nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages} 页", callback_data="cal_ignore"))
-        if page < total_pages - 1:
-            nav_row.append(InlineKeyboardButton("下一页 ▶️", callback_data=f"list_m_page_{page + 1}"))
-
-        keyboard.append(nav_row)
-        keyboard.append([InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")])
-
-        await safe_edit_message(
-            query,
-            f"📋 **阶段节点管理 (共 {len(milestones)} 项 · 第 {page + 1}/{total_pages} 页)**：\n点击即可标记完成、修改目标金额、修改截止日期或删除：",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        panel_text, panel_kb = build_milestone_list_panel(chat_id, page=page)
+        await safe_edit_message(query, panel_text, reply_markup=panel_kb)
 
     elif data.startswith("editmoney_m_"):
-        m_id = int(data.replace("editmoney_m_", ""))
+        parts = data.replace("editmoney_m_", "").split("_")
+        m_id = int(parts[0])
+        page = int(parts[1]) if len(parts) > 1 else 0
         milestones = db.get_milestones(chat_id, status="pending")
         target_m = next((m for m in milestones if m["id"] == m_id), None)
         if not target_m:
@@ -997,7 +1040,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[chat_id] = {
             "action": "edit_milestone_money_input",
             "milestone_id": m_id,
-            "title": target_m["title"]
+            "title": target_m["title"],
+            "page": page
         }
         rates = fx.get_exchange_rates()
         curr_money_str = fx.format_dual_currency(target_m["target_money"], rates)
@@ -1009,17 +1053,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- 例如输入欧元：`800`、`800欧`、`€800`\n"
             f"- 例如输入人民币：`6000元`、`¥6000`\n"
             f"- 例如输入工时：`40h` 或 `40小时`\n\n"
-            f"输入后系统会自动重新换算并重新测算所有排班！"
+            f"输入后将自动保存并返回节点管理列表！"
         )
-        await safe_edit_message(query, prompt, reply_markup=cancel_btn)
+        back_to_list_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消并返回节点列表", callback_data=f"list_m_page_{page}")]])
+        await safe_edit_message(query, prompt, reply_markup=back_to_list_btn)
     
     elif data.startswith("editdate_m_"):
-        m_id = int(data.replace("editdate_m_", ""))
+        parts = data.replace("editdate_m_", "").split("_")
+        m_id = int(parts[0])
+        page = int(parts[1]) if len(parts) > 1 else 0
+        user_states[chat_id] = {"msedit_page": page}
         milestones = db.get_milestones(chat_id, status="pending")
         target_m = next((m for m in milestones if m["id"] == m_id), None)
         title = target_m["title"] if target_m else "该节点"
         curr_d = parse_date_safely(target_m["target_date"]) if target_m else get_today()
-        cal_kb = build_datepicker_keyboard(curr_d.year, curr_d.month, "msedit", extra_id=m_id)
+        cal_kb = build_datepicker_keyboard(
+            curr_d.year, curr_d.month, "msedit", extra_id=m_id,
+            return_cb=f"list_m_page_{page}", return_text="🔙 取消并返回节点列表"
+        )
         await safe_edit_message(
             query,
             f"📅 **修改节点截止日期**\n\n"
@@ -1031,20 +1082,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("msedit_nav_"):
         parts = data.split("_")
         y, m, m_id = int(parts[2]), int(parts[3]), int(parts[4])
-        cal_kb = build_datepicker_keyboard(y, m, "msedit", extra_id=m_id)
+        page = user_states.get(chat_id, {}).get("msedit_page", 0)
+        cal_kb = build_datepicker_keyboard(
+            y, m, "msedit", extra_id=m_id,
+            return_cb=f"list_m_page_{page}", return_text="🔙 取消并返回节点列表"
+        )
         await query.edit_message_reply_markup(reply_markup=cal_kb)
 
     elif data.startswith("msedit_date_"):
         parts = data.split("_")
         new_d_str = parts[2]
         m_id = int(parts[3])
+        page = user_states.pop(chat_id, {}).get("msedit_page", 0)
         title = db.update_milestone_date(m_id, chat_id, new_d_str)
         try:
             await query.answer(f"✅ 已将【{title}】截止日期更新为 {new_d_str}！", show_alert=False)
         except Exception:
             pass
-        text = f"✅ 已成功将【**{title}**】截止日期更新为 `{new_d_str}`！\n\n" + format_overview(chat_id)
-        await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id))
+        notice = f"✅ 已成功将【**{title}**】截止日期更新为 `{new_d_str}`！"
+        panel_text, panel_kb = build_milestone_list_panel(chat_id, page=page, notice=notice)
+        await safe_edit_message(query, text=panel_text, reply_markup=panel_kb)
 
     elif data.startswith("mspick_nav_"):
         parts = data.split("_")
@@ -1058,7 +1115,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = user_states.get(chat_id)
         if not state or state.get("action") != "pick_milestone_date":
             await query.answer("⚠️ 流程已过期，请重新点击【➕ 添加阶段节点】", show_alert=True)
-            await safe_edit_message(query, "⚠️ 流程已过期，请返回主看板重新添加。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回看板", callback_data="refresh")]]))
+            await safe_edit_message(query, "⚠️ 流程已过期，请重新选择操作：", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ 重新添加阶段节点", callback_data="add_milestone")],
+                [InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")]
+            ]))
             return
         title = state["title"]
         hours = state["hours"]
@@ -1078,66 +1138,65 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         res_text = (
-            f"✅ 成功添加阶段节点 **{title}**！\n"
+            f"✅ **成功添加阶段节点【{title}】！**\n\n"
             f"📅 截止时间: `{chosen_date_str}`\n"
             f"💰 目标金额: `{money_dual}`\n"
             f"⏱️ 换算所需工时: `{hours:.1f}` 小时 (按时薪 {hourly_str})\n\n"
-        ) + format_overview(chat_id)
-        await safe_edit_message(query, res_text, reply_markup=get_main_keyboard(chat_id))
+            "您可以继续添加下一个节点，或自行选择返回主看板："
+        )
+        sub_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("➕ 继续添加下一个节点", callback_data="add_milestone"),
+                InlineKeyboardButton("📋 进入节点管理列表", callback_data="list_milestones"),
+            ],
+            [InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")]
+        ])
+        await safe_edit_message(query, res_text, reply_markup=sub_kb)
     
     elif data.startswith("done_m_"):
-        m_id = int(data.replace("done_m_", ""))
+        parts = data.replace("done_m_", "").split("_")
+        m_id = int(parts[0])
+        page = int(parts[1]) if len(parts) > 1 else 0
         title, deducted_money = db.complete_milestone(m_id, chat_id)
         rates = fx.get_exchange_rates()
         deducted_str = fx.format_dual_currency(deducted_money, rates)
-        text = (
+        try:
+            await query.answer(f"🎉 已完成【{title}】！", show_alert=False)
+        except Exception:
+            pass
+        notice = (
             f"🎉 **阶段节点【{title}】已完成！**\n"
-            f"💰 已按计划从当前总资金中扣除: `-{deducted_str}`\n\n"
-        ) + format_overview(chat_id)
-        await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id))
+            f"💰 已按计划从当前总资金中扣除: `-{deducted_str}`"
+        )
+        panel_text, panel_kb = build_milestone_list_panel(chat_id, page=page, notice=notice)
+        await safe_edit_message(query, text=panel_text, reply_markup=panel_kb)
         
     elif data.startswith("del_m_"):
-        m_id = int(data.replace("del_m_", ""))
+        parts = data.replace("del_m_", "").split("_")
+        m_id = int(parts[0])
+        page = int(parts[1]) if len(parts) > 1 else 0
         db.delete_milestone(m_id, chat_id)
-        text = "🗑️ 已删除该阶段节点。\n\n" + format_overview(chat_id)
-        await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id))
+        try:
+            await query.answer("🗑️ 已删除该阶段节点", show_alert=False)
+        except Exception:
+            pass
+        panel_text, panel_kb = build_milestone_list_panel(chat_id, page=page, notice="🗑️ **已删除该阶段节点。**")
+        await safe_edit_message(query, text=panel_text, reply_markup=panel_kb)
 
     elif data == "manage_fixed_expenses" or data.startswith("del_fexp_"):
+        user_states.pop(chat_id, None)
+        notice = ""
         if data.startswith("del_fexp_"):
             exp_id = int(data.replace("del_fexp_", ""))
             del_title = db.delete_fixed_expense(exp_id, chat_id)
+            notice = f"🗑️ **已成功删除固定支出【{del_title}】**"
             try:
                 await query.answer(f"🗑️ 已删除固定支出【{del_title}】", show_alert=False)
             except Exception:
                 pass
 
-        expenses = db.get_fixed_expenses(chat_id)
-        rates = fx.get_exchange_rates()
-        keyboard = [
-            [InlineKeyboardButton("➕ 添加一项固定支出", callback_data="add_fixed_expense")]
-        ]
-        if not expenses:
-            msg_text = (
-                "📉 **【固定每月支出管理】**\n\n"
-                "当前暂未设置任何固定每月支出（如房租、生活费、学费、分期还款等）。\n\n"
-                "💡 设置后，系统会自动在每个月的对应日期扣减该支出（支持设置**到期结束月份**，到期后自动停止），无需再每个月手动新建重复的阶段节点！"
-            )
-        else:
-            total_m = sum(e["amount"] for e in expenses)
-            msg_text = (
-                f"📉 **【固定每月支出管理】** (共 {len(expenses)} 项 · 合计 `{fx.format_dual_currency(total_m, rates)} /月`)\n\n"
-                "当前生效中的固定支出如下（点击下方按钮可删除或新增）：\n\n"
-            )
-            for idx, e in enumerate(expenses, 1):
-                e_dual = fx.format_dual_currency(e["amount"], rates)
-                end_desc = f"至 `{e['end_date'][:7]}` 结束" if e.get("end_date") else "长期有效"
-                msg_text += f"{idx}. **{e['title']}**: `{e_dual}/月` (每月 `{e['pay_day']}` 日 | {end_desc})\n"
-                keyboard.append([
-                    InlineKeyboardButton(f"🗑️ 删除: {e['title']} (€{e['amount']:.0f}/月)", callback_data=f"del_fexp_{e['id']}")
-                ])
-
-        keyboard.append([InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")])
-        await safe_edit_message(query, msg_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        msg_text, panel_kb = build_fixed_expenses_panel(chat_id, notice=notice)
+        await safe_edit_message(query, msg_text, reply_markup=panel_kb)
 
     elif data == "add_fixed_expense":
         user_states[chat_id] = {"action": "add_fixed_expense_input"}
@@ -1151,7 +1210,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• `分期还款 1086.79欧 每月6号 到2027-03结束`\n"
             "• `健身房 500元`（默认每月1号、长期有效）"
         )
-        await safe_edit_message(query, prompt, reply_markup=cancel_btn)
+        back_to_fexp_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消并返回固定支出列表", callback_data="manage_fixed_expenses")]])
+        await safe_edit_message(query, prompt, reply_markup=back_to_fexp_btn)
 
     elif data == "manage_off_days":
         today = get_today()
@@ -1490,21 +1550,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 current = profile["current_balance"] if profile else 0.0
                 new_balance = current + val_eur
                 db.update_profile(chat_id, current_balance=new_balance)
-                msg = f"🎉 成功增加资金：`+{dual_str}`！\n💰 最新当前资金：`{fx.format_dual_currency(new_balance, rates)}`"
+                msg = f"🎉 **成功增加资金**：`+{dual_str}`！\n💰 **最新当前资金**：`{fx.format_dual_currency(new_balance, rates)}`"
+                again_btn = InlineKeyboardButton("➕ 再记一笔新收入", callback_data="add_balance")
             elif action == "set_balance":
                 db.update_profile(chat_id, current_balance=val_eur)
-                msg = f"✅ 当前资金总额已重置为：`{dual_str}`"
+                msg = f"✅ **当前资金总额已重置为**：`{dual_str}`"
+                again_btn = InlineKeyboardButton("💰 重新修改总资金", callback_data="set_balance")
             elif action == "set_target":
                 db.update_profile(chat_id, target_amount=val_eur)
-                msg = f"✅ 目标金额已更新为：`{dual_str}`"
+                msg = f"✅ **目标金额已更新为**：`{dual_str}`"
+                again_btn = InlineKeyboardButton("🎯 重新修改目标金额", callback_data="set_target")
             elif action == "set_rate":
                 db.update_profile(chat_id, hourly_rate=val_eur)
                 hourly_str = fx.format_hourly_rate(val_eur, rates)
-                msg = f"✅ 当前时薪已更新为：`{hourly_str}` /小时"
+                msg = f"✅ **当前 Freelancer 时薪已更新为**：`{hourly_str}` /小时"
+                again_btn = InlineKeyboardButton("⏱️ 重新修改时薪", callback_data="set_rate")
             
             user_states.pop(chat_id, None)
-            new_text = f"{msg}\n\n" + format_overview(chat_id)
-            await update.message.reply_text(new_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
+            sub_kb = InlineKeyboardMarkup([
+                [again_btn],
+                [InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")]
+            ])
+            await update.message.reply_text(msg, reply_markup=sub_kb, parse_mode="Markdown")
         except ValueError:
             await update.message.reply_text("❌ 输入格式错误，请输入有效的金额（支持带元/欧/刀/USD）：")
             
@@ -1514,11 +1581,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ 未能识别有效金额或月份，请重新输入（例如 `2600欧 12月` 或 `从12月开始我的固定收入是2600欧`）：")
             return
         val_eur, fixed_start, fixed_day, mode = parsed
+        sub_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💼 重新修改固定工作月薪", callback_data="set_fixed_salary")],
+            [InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")]
+        ])
         if mode == "closed" or val_eur <= 0:
             db.update_profile(chat_id, fixed_salary=0.0, fixed_salary_start="", fixed_salary_day=1)
             user_states.pop(chat_id, None)
-            res_text = "✅ **已关闭固定工作月薪**，所有节点将完全依赖 Freelancer 工时推算。\n\n" + format_overview(chat_id)
-            await update.message.reply_text(res_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
+            res_text = "✅ **已关闭固定工作月薪**，所有节点将完全依赖 Freelancer 工时推算。"
+            await update.message.reply_text(res_text, reply_markup=sub_kb, parse_mode="Markdown")
             return
 
         db.update_profile(chat_id, fixed_salary=val_eur, fixed_salary_start=fixed_start, fixed_salary_day=fixed_day)
@@ -1529,9 +1600,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎉 **固定工作月薪设置成功！**\n\n"
             f"💼 **每月税后到账**: `{val_dual}`\n"
             f"📅 **首次生效**: `{fixed_start}` 起 (每月 `{fixed_day}` 日到账)\n\n"
-            f"系统已重新测算：固定工资先冲抵未来阶段目标，剩余缺口由 Freelancer 工时补齐！\n\n"
-        ) + format_overview(chat_id)
-        await update.message.reply_text(res_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
+            f"系统已重新测算：固定工资先冲抵未来阶段目标，剩余缺口由 Freelancer 工时补齐！"
+        )
+        await update.message.reply_text(res_text, reply_markup=sub_kb, parse_mode="Markdown")
 
     elif action == "add_fixed_expense_input":
         parsed = parse_fixed_expense_input(text, rates)
@@ -1547,13 +1618,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         val_dual = fx.format_dual_currency(val_eur, rates)
         end_desc = f"至 `{end_date[:7]}` 结束（到期自动停扣）" if end_date else "长期有效"
-        res_text = (
-            f"🎉 **固定每月支出添加成功！**\n\n"
-            f"📌 **支出项目**: 【**{title}**】\n"
-            f"💸 **每月金额**: `{val_dual}` (每月 `{pay_day}` 日自动计入)\n"
-            f"📅 **有效期**: {end_desc}\n\n"
-        ) + format_overview(chat_id)
-        await update.message.reply_text(res_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
+        notice = (
+            f"🎉 **固定每月支出添加成功！**\n"
+            f"📌 项目: 【**{title}**】 | 💸 金额: `{val_dual}/月` (每月 `{pay_day}` 日) | 📅 期限: {end_desc}"
+        )
+        panel_text, panel_kb = build_fixed_expenses_panel(chat_id, notice=notice)
+        await update.message.reply_text(panel_text, reply_markup=panel_kb, parse_mode="Markdown")
             
     elif action == "add_milestone_input":
         profile = db.get_profile(chat_id)
@@ -1622,12 +1692,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 hourly_str = fx.format_hourly_rate(rate, rates)
 
                 res_text = (
-                    f"✅ 成功添加阶段节点 **{title}**！\n"
+                    f"✅ **成功添加阶段节点【{title}】！**\n\n"
                     f"📅 截止时间: `{date_str}`\n"
                     f"💰 目标金额: `{money_dual}`\n"
                     f"⏱️ 换算所需工时: `{hours:.1f}` 小时 (按时薪 {hourly_str})\n\n"
-                ) + format_overview(chat_id)
-                await update.message.reply_text(res_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
+                    "您可以继续添加下一个节点，或自行选择返回主看板："
+                )
+                sub_kb = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("➕ 继续添加下一个节点", callback_data="add_milestone"),
+                        InlineKeyboardButton("📋 进入节点管理列表", callback_data="list_milestones"),
+                    ],
+                    [InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")]
+                ])
+                await update.message.reply_text(res_text, reply_markup=sub_kb, parse_mode="Markdown")
             except ValueError:
                 await update.message.reply_text("❌ 工时或金额解析错误，请重新输入：")
                 return
@@ -1641,6 +1719,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "edit_milestone_money_input":
         m_id = state.get("milestone_id")
         title = state.get("title", "该节点")
+        page = state.get("page", 0)
         profile = db.get_profile(chat_id)
         rate = profile["hourly_rate"] if profile else 0.0
 
@@ -1662,12 +1741,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states.pop(chat_id, None)
 
             money_dual = fx.format_dual_currency(money_eur, rates)
-            res_text = (
-                f"✅ **成功修改节点目标金额！**\n\n"
-                f"📌 节点: 【**{title}**】\n"
-                f"💰 最新目标金额: `{money_dual}` (`{hours:.1f}h`)\n\n"
-            ) + format_overview(chat_id)
-            await update.message.reply_text(res_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
+            notice = (
+                f"✅ **成功修改节点【{title}】目标金额为 `{money_dual}` (`{hours:.1f}h`)！**"
+            )
+            panel_text, panel_kb = build_milestone_list_panel(chat_id, page=page, notice=notice)
+            await update.message.reply_text(panel_text, reply_markup=panel_kb, parse_mode="Markdown")
         except ValueError:
             await update.message.reply_text("❌ 输入格式错误，请输入有效的金额或工时（支持带元/欧/刀/h）：")
 
