@@ -563,20 +563,6 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
 
             chosen_pace = best_pace
 
-            phases.append({
-                "bottleneck": bottleneck_d,
-                "pace": chosen_pace,
-                "raw_pace": best_pace,
-                "dates": phase_dates,
-                "start_dt": phase_start_dt,
-                "workdays": phase_w,
-                "fixed_income": phase_fixed_m,
-                "fixed_expense": phase_fixed_exp
-            })
-
-            for d_str in phase_dates:
-                date_pace_map[d_str] = chosen_pace
-
             if phase_w > 0 and chosen_pace <= 10.0:
                 total_earned_freelance = phase_w * chosen_pace * rate
             elif phase_w > 0 and chosen_pace > 10.0:
@@ -586,8 +572,28 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
 
             total_earned = total_earned_freelance + phase_fixed_m
             total_due = sum(date_groups[d]["total_money"] for d in phase_dates) + phase_fixed_exp
-            if not phases[1:]:
+            if not phases:
                 total_due += initial_uncovered_overdue
+
+            phase_gap_m = max(0.0, total_due - (phase_start_cash + phase_fixed_m))
+            phase_req_h = (phase_gap_m / rate) if rate > 0 else 0.0
+            phase_shortfall_h = max(0.0, phase_req_h - phase_w * 10.0)
+
+            phases.append({
+                "bottleneck": bottleneck_d,
+                "pace": chosen_pace,
+                "raw_pace": best_pace,
+                "dates": phase_dates,
+                "start_dt": phase_start_dt,
+                "workdays": phase_w,
+                "fixed_income": phase_fixed_m,
+                "fixed_expense": phase_fixed_exp,
+                "shortfall_h": phase_shortfall_h
+            })
+
+            for d_str in phase_dates:
+                date_pace_map[d_str] = chosen_pace
+
             phase_start_cash = max(0.0, phase_start_cash + total_earned - total_due)
             phase_start_dt = date_groups[bottleneck_d]["dt"]
             remaining_dates = remaining_dates[best_idx + 1:]
@@ -608,6 +614,7 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                 prev["workdays"] = calculate_workdays(s_calc, date_groups[p["bottleneck"]]["dt"], work_date_set)
                 prev["fixed_income"] += p.get("fixed_income", 0.0)
                 prev["fixed_expense"] += p.get("fixed_expense", 0.0)
+                prev["shortfall_h"] = prev.get("shortfall_h", 0.0) + p.get("shortfall_h", 0.0)
             else:
                 merged_phases.append(dict(p))
 
@@ -646,16 +653,26 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                 if int_fixed_exp > 0:
                     notes.append(f"固定支出-€{int_fixed_exp:.0f}")
                 fixed_note = f" ({' | '.join(notes)})" if notes else ""
-                surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else ("，全额达成" if surplus >= -0.01 else f"，尚有缺口 `{fx.format_dual_currency(abs(surplus), rates)}`")
                 rounded_pace = round(pace_hours, 1)
 
-                if rounded_pace == 0.0:
+                if surplus < -0.01 or rounded_pace > 10.0:
+                    short_h = (max(0.0, -surplus) / rate) if rate > 0 else 0.0
+                    if short_h > 0.05:
+                        interval_lines.append(f"• ⚠️天数不足 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): 天数不够，还需 `{short_h:.1f}h`{fixed_note}")
+                    elif int_workdays == 0:
+                        surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else "，全额达成"
+                        interval_lines.append(f"• 🟢全额覆盖 `[{prev_name} ➔ {curr_name}]` (0兼职日 | {grp_names}): 需 `0.0h/天`{fixed_note}{surplus_str}")
+                    else:
+                        surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else "，全额达成"
+                        interval_lines.append(f"• 🔥冲刺期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): 需 `{eff_pace:.1f}h/天`{fixed_note}{surplus_str}")
+                elif rounded_pace == 0.0:
+                    surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else "，全额达成"
                     interval_lines.append(f"• 🟢全额覆盖 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): 需 `0.0h/天`{fixed_note}{surplus_str}")
-                elif rounded_pace > 10.0:
-                    interval_lines.append(f"• ⚠️天数不足 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): 当前freelancer工作天数不够，建议在日历里面设置更多工作天数{fixed_note}{surplus_str}")
                 elif rounded_pace > 6.0:
+                    surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else "，全额达成"
                     interval_lines.append(f"• 🔥冲刺期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{fixed_note}{surplus_str}")
                 else:
+                    surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else "，全额达成"
                     interval_lines.append(f"• 🟢平稳期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{fixed_note}{surplus_str}")
                 prev_d = d_dt
             except Exception:
@@ -686,7 +703,8 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                     text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): 需 `0.0h/天`{fixed_note}\n"
                 elif p_rounded > 10.0:
                     tag = f"⚠️阶段{idx}·天数不足"
-                    text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): 当前freelancer工作天数不够，建议在日历里面设置更多工作天数{fixed_note}\n"
+                    short_h = p.get("shortfall_h", 0.0)
+                    text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): 天数不够，还需 `{short_h:.1f}h`{fixed_note}\n"
                 elif p_rounded > 6.0:
                     tag = f"🔥阶段{idx}·冲刺"
                     text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): 需 `{p_rounded:.1f}h/天`{fixed_note}\n"
