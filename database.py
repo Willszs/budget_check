@@ -55,6 +55,13 @@ def restore_from_seed(seed_str: str) -> bool:
                 INSERT OR REPLACE INTO extra_work_days (id, chat_id, work_date, note, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 """, (r.get("id"), r["chat_id"], r["work_date"], r.get("note", ""), r.get("created_at", "")))
+        if "fixed_expenses" in data:
+            cursor.execute("DELETE FROM fixed_expenses")
+            for r in data["fixed_expenses"]:
+                cursor.execute("""
+                INSERT OR REPLACE INTO fixed_expenses (id, chat_id, title, amount, pay_day, start_date, end_date, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (r.get("id"), r["chat_id"], r["title"], r["amount"], r.get("pay_day", 1), r.get("start_date", ""), r.get("end_date", ""), r.get("created_at", "")))
         conn.commit()
         conn.close()
         return True
@@ -119,13 +126,27 @@ def init_db():
     )
     """)
 
-    # 周末特别开工/加班日表（将原本休息的周末指定为工作日）
+    # 兼职开工日表（用户主动点选的 Freelancer 工作日）
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS extra_work_days (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER,
         work_date TEXT, -- 具体日期 YYYY-MM-DD
         note TEXT,
+        created_at TEXT
+    )
+    """)
+
+    # 固定每月支出表（支持设置到期日/期限 end_date）
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS fixed_expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        title TEXT,
+        amount REAL,
+        pay_day INTEGER DEFAULT 1,
+        start_date TEXT DEFAULT '',
+        end_date TEXT DEFAULT '',
         created_at TEXT
     )
     """)
@@ -366,6 +387,52 @@ def delete_work_day(chat_id: int, work_date: str):
     cursor.execute("DELETE FROM extra_work_days WHERE chat_id = ? AND work_date = ?", (chat_id, work_date))
     conn.commit()
     conn.close()
+
+def add_fixed_expense(chat_id: int, title: str, amount: float, pay_day: int = 1, start_date: str = "", end_date: str = ""):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    now_str = datetime.now().isoformat()
+    cursor.execute("""
+    INSERT INTO fixed_expenses (chat_id, title, amount, pay_day, start_date, end_date, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (chat_id, title, amount, pay_day, start_date, end_date, now_str))
+    exp_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return exp_id
+
+def get_fixed_expenses(chat_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT id, title, amount, pay_day, start_date, end_date
+    FROM fixed_expenses WHERE chat_id = ? ORDER BY pay_day ASC, id ASC
+    """, (chat_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0],
+            "title": r[1],
+            "amount": r[2],
+            "pay_day": r[3] if r[3] is not None else 1,
+            "start_date": r[4] if r[4] is not None else "",
+            "end_date": r[5] if r[5] is not None else ""
+        }
+        for r in rows
+    ]
+
+def delete_fixed_expense(expense_id: int, chat_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT title FROM fixed_expenses WHERE id = ? AND chat_id = ?", (expense_id, chat_id))
+    row = cursor.fetchone()
+    title = row[0] if row else ""
+    cursor.execute("DELETE FROM fixed_expenses WHERE id = ? AND chat_id = ?", (expense_id, chat_id))
+    conn.commit()
+    conn.close()
+    return title
+
 
 
 

@@ -52,26 +52,14 @@ def get_today() -> date:
     tz = pytz.timezone(TIMEZONE)
     return datetime.now(tz).date()
 
-def calculate_workdays(start_date: date, end_date: date, off_dates: set = None, include_weekends: bool = False, extra_work_dates: set = None) -> int:
-    """计算从 start_date 到 end_date 之间的可用工作天数（可选是否包含全周末，扣除自定义请假休息日，增加周末特别开工日）"""
-    if start_date > end_date:
+def calculate_workdays(start_date: date, end_date: date, work_dates: set = None, **kwargs) -> int:
+    """计算从 start_date 到 end_date 之间用户主动设定的 Freelancer 兼职工作天数"""
+    if start_date > end_date or not work_dates:
         return 0
-    if off_dates is None:
-        off_dates = set()
-    if extra_work_dates is None:
-        extra_work_dates = set()
     workdays = 0
     curr = start_date
     while curr <= end_date:
-        curr_str = curr.strftime("%Y-%m-%d")
-        if include_weekends:
-            is_working_day = (curr_str not in off_dates)
-        else:
-            if curr.weekday() < 5:
-                is_working_day = (curr_str not in off_dates)
-            else:
-                is_working_day = (curr_str in extra_work_dates)
-        if is_working_day:
+        if curr.strftime("%Y-%m-%d") in work_dates:
             workdays += 1
         curr += timedelta(days=1)
     return workdays
@@ -138,7 +126,7 @@ def parse_fixed_salary_input(text: str, rates: dict):
 
     fixed_start = ""
     # 匹配 YYYY-MM-DD 或 YYYY-MM
-    m_ymd = re.search(r"(\d{4})[-/.](\d{1,2})(?:[-/.](\d{1,2}))?", t)
+    m_ymd = re.search(r"(20\d{2})[-/](\d{1,2})(?:[-/](\d{1,2}))?", t)
     if m_ymd:
         y = int(m_ymd.group(1))
         m = int(m_ymd.group(2))
@@ -179,9 +167,96 @@ def parse_fixed_salary_input(text: str, rates: dict):
 
     return val_eur, fixed_start, fixed_day, "ok"
 
+def get_fixed_expense_payments(start_range: date, end_range: date, expenses: list) -> float:
+    """计算在 [start_range, end_range] 日期区间内所有生效中固定支出的总扣款金额"""
+    if not expenses or start_range > end_range:
+        return 0.0
+    total_exp = 0.0
+    for exp in expenses:
+        amt = exp.get("amount", 0.0) or 0.0
+        if amt <= 0:
+            continue
+        pay_day = exp.get("pay_day", 1) or 1
+        start_str = exp.get("start_date", "") or ""
+        end_str = exp.get("end_date", "") or ""
+        start_eff = parse_date_safely(start_str) if start_str else date.min
+        if start_eff == date.max:
+            start_eff = date.min
+        end_eff = parse_date_safely(end_str) if end_str else date.max
+
+        y, m = start_range.year, start_range.month
+        end_y, end_m = end_range.year, end_range.month
+        while (y < end_y) or (y == end_y and m <= end_m):
+            _, max_day = calendar.monthrange(y, m)
+            p_date = date(y, m, min(pay_day, max_day))
+            if start_range <= p_date <= end_range and start_eff <= p_date <= end_eff:
+                total_exp += amt
+            if m == 12:
+                y += 1
+                m = 1
+            else:
+                m += 1
+    return total_exp
+
+def parse_fixed_expense_input(text: str, rates: dict):
+    """智能解析用户输入的固定每月支出、扣款日与到期月份，例如：'房租 1000欧 每月1号' 或 '学费 650欧 30号 到2027-02结束'"""
+    t = text.strip()
+    t = re.sub(r"^(?:添加|新增|设置)?(?:固定支出|固定开销|每月支出)\s*", "", t).strip()
+    today = get_today()
+
+    # 1. 提取截止期限 (e.g. 到2027-03结束, 至2027-02, 2027-03到期, 2027-03-15, 到3月结束, 到明年3月)
+    end_date = ""
+    m_end_ymd = re.search(r"(?:到|至|截止到?|期限)?\s*(20\d{2})[-/](\d{1,2})(?:[-/](\d{1,2}))?\s*(?:结束|到期|截止|为止)?", t)
+    if m_end_ymd and 1 <= int(m_end_ymd.group(2)) <= 12:
+        ey = int(m_end_ymd.group(1))
+        em = int(m_end_ymd.group(2))
+        _, max_ed = calendar.monthrange(ey, em)
+        if m_end_ymd.group(3):
+            ed = min(max_ed, max(1, int(m_end_ymd.group(3))))
+        else:
+            ed = max_ed
+        end_date = f"{ey:04d}-{em:02d}-{ed:02d}"
+        t = t[:m_end_ymd.start()] + " " + t[m_end_ymd.end():]
+    else:
+        m_end_m = re.search(r"(?:到|至|截止到?)\s*(?:明年)?\s*(\d{1,2})\s*月(?:\s*(?:份|底|结束|到期|截止|为止))?", t)
+        if m_end_m and 1 <= int(m_end_m.group(1)) <= 12:
+            em = int(m_end_m.group(1))
+            ey = today.year if em >= today.month else today.year + 1
+            _, ed = calendar.monthrange(ey, em)
+            end_date = f"{ey:04d}-{em:02d}-{ed:02d}"
+            t = t[:m_end_m.start()] + " " + t[m_end_m.end():]
+
+    # 2. 提取每月扣款日 (e.g. 每月6号, 每月30日, 6号, 30日)
+    pay_day = 1
+    m_day = re.search(r"(?:每月)?\s*(\d{1,2})\s*[日号](?:扣款|到账|交)?", t)
+    if m_day and 1 <= int(m_day.group(1)) <= 31:
+        pay_day = int(m_day.group(1))
+        t = t[:m_day.start()] + " " + t[m_day.end():]
+
+    # 3. 提取金额 (e.g. 1000欧, 600, €650, 5000元)
+    m_amt = re.search(r"([€$¥]?\s*\d+(?:\.\d+)?\s*(?:欧|eur|euro|元|rmb|cny|块|刀|usd|\$|€|¥)?)", t, re.I)
+    if not m_amt:
+        return None
+    amt_str = m_amt.group(1).strip()
+    try:
+        val_eur, _ = fx.parse_currency_input(amt_str, rates)
+    except Exception:
+        return None
+    if val_eur <= 0:
+        return None
+    t = t[:m_amt.start()] + " " + t[m_amt.end():]
+
+    # 4. 剩余部分作为名称 title
+    title = re.sub(r"(每月|长期|无期限|到|至|结束|到期)", " ", t).strip()
+    if not title:
+        title = "固定支出"
+
+    start_date = f"{today.year:04d}-{today.month:02d}-01"
+    return title, val_eur, pay_day, start_date, end_date
+
 
 def build_calendar_keyboard(chat_id: int, year: int, month: int):
-    """生成带有状态切换的 Telegram 交互式日历组件（支持请假与周末开工）"""
+    """生成带有状态切换的 Telegram 交互式日历组件（主动点选哪一天，哪一天算 Freelancer 工作日）"""
     keyboard = []
     
     # 顶部年月与切换月份按钮
@@ -198,9 +273,7 @@ def build_calendar_keyboard(chat_id: int, year: int, month: int):
     week_headers = ["一", "二", "三", "四", "五", "六", "日"]
     keyboard.append([InlineKeyboardButton(w, callback_data="cal_ignore") for w in week_headers])
 
-    # 获取当前用户的休息日与周末开工日
-    off_days = db.get_off_days(chat_id)
-    off_date_set = {od["off_date"] for od in off_days}
+    # 获取当前用户选中的 Freelancer 兼职开工日
     work_days = db.get_work_days(chat_id)
     work_date_set = {wd["work_date"] for wd in work_days}
     today_str = get_today().strftime("%Y-%m-%d")
@@ -214,22 +287,14 @@ def build_calendar_keyboard(chat_id: int, year: int, month: int):
                 row.append(InlineKeyboardButton(" ", callback_data="cal_ignore"))
             else:
                 d_str = f"{year:04d}-{month:02d}-{day_num:02d}"
-                is_off = d_str in off_date_set
-                is_extra_work = d_str in work_date_set
-                is_weekend = calendar.weekday(year, month, day_num) >= 5
+                is_work = d_str in work_date_set
 
                 # 显示图标：
-                # 🏖️ 请假休息日
-                # 💼 周末加班开工日
-                # 💤 默认周末休息
-                # 📍 今天
-                # 正常数字
-                if is_off:
-                    btn_text = f"🏖️{day_num}"
-                elif is_extra_work:
+                # 💼 = 选中的兼职工作日
+                # 📍 = 今天（未选兼职时）
+                # 正常数字 = 无兼职安排（默认全职上班/休息）
+                if is_work:
                     btn_text = f"💼{day_num}"
-                elif is_weekend:
-                    btn_text = f"💤{day_num}"
                 elif d_str == today_str:
                     btn_text = f"📍{day_num}"
                 else:
@@ -240,7 +305,7 @@ def build_calendar_keyboard(chat_id: int, year: int, month: int):
 
     # 底部图例与返回按钮
     keyboard.append([
-        InlineKeyboardButton("🏖️请假 | 💼周末开工 | 💤周末休息 (点击切换)", callback_data="cal_ignore")
+        InlineKeyboardButton("💼 = 兼职工作日 | 数字 = 无兼职 (点击切换)", callback_data="cal_ignore")
     ])
     keyboard.append([
         InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")
@@ -306,6 +371,28 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
         start_desc = f"从 {fixed_start[:7]} 起 " if fixed_start else ""
         fixed_salary_desc = f"{start_desc}`{fixed_salary_dual} /月` (每月 {fixed_day} 日到账)"
 
+    today = get_today()
+    fixed_expenses = db.get_fixed_expenses(chat_id)
+    active_expenses = []
+    for exp in fixed_expenses:
+        end_str = exp.get("end_date", "") or ""
+        if end_str:
+            end_dt = parse_date_safely(end_str)
+            if end_dt < today:
+                continue
+        active_expenses.append(exp)
+
+    if active_expenses:
+        total_monthly_exp = sum(e["amount"] for e in active_expenses)
+        exp_dual = fx.format_dual_currency(total_monthly_exp, rates)
+        fixed_exp_desc = f"共 {len(active_expenses)} 项 (合计 `{exp_dual} /月`)\n"
+        for e in active_expenses:
+            e_amt_str = f"€{e['amount']:.0f}" if e["amount"] == int(e["amount"]) else f"€{e['amount']:.2f}"
+            end_label = f"至 {e['end_date'][:7]} 结束" if e.get("end_date") else "长期"
+            fixed_exp_desc += f"  ◦ **{e['title']}**: `{e_amt_str}/月` (每月{e['pay_day']}日 | {end_label})\n"
+    else:
+        fixed_exp_desc = "未设置 (点击【📉 固定支出管理】添加)\n"
+
     text = (
         "📊 **【财务与目标多币种看板】**\n"
         f"💱 **实时汇率**: `1 EUR ≈ {cny_rate:.4f} CNY` | `1 EUR ≈ {usd_rate:.4f} USD`\n"
@@ -313,6 +400,7 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
         f"💰 **当前资金**: `{fx.format_dual_currency(balance, rates)}`\n"
         f"⏱️ **Freelancer时薪**: `{fx.format_hourly_rate(rate, rates)} /小时`\n"
         f"💼 **固定工作月薪**: {fixed_salary_desc}\n"
+        f"📉 **固定每月支出**: {fixed_exp_desc}"
     )
     
     # 获取阶段节点
@@ -336,14 +424,9 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                 money_dual = fx.format_dual_currency(m['target_money'], rates)
                 text += f"{idx}. 📌 **{m['title']}** (`{m['target_date']}`): `{money_dual}` (`{m['target_hours']:.1f}h`)\n"
 
-        # 智能瓶颈推算：资金优先冲销最近节点
-        user_off_days = db.get_off_days(chat_id)
-        off_date_set = {od["off_date"] for od in user_off_days}
+        # 智能瓶颈推算：仅按用户在日历主动点选的兼职工作日计算
         user_work_days = db.get_work_days(chat_id)
-        extra_work_set = {wd["work_date"] for wd in user_work_days}
-        today = get_today()
-
-        MIN_DAILY_FLOOR = 5.0
+        work_date_set = {wd["work_date"] for wd in user_work_days}
 
         # 按日期聚合节点目标，支持多阶段精准瓶颈推算
         date_groups = {}
@@ -358,7 +441,7 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
         sorted_dates = sorted(date_groups.keys(), key=lambda d: parse_date_safely(d))
 
         # 核心算法：多阶段动态瓶颈推算（Multi-Phase Piecewise Bottleneck Scheduling）
-        # 计入各区间内如期到账的固定工资，优先抵扣债务/开销，剩余缺口由 Freelancer 工时精确承接
+        # 计入各区间内如期到账的固定工资与应扣的固定支出，剩余缺口由 Freelancer 兼职工时精确承接
         overdue_money = sum(date_groups[d]["total_money"] for d in sorted_dates if parse_date_safely(d) < today)
         remaining_dates = [d for d in sorted_dates if parse_date_safely(d) >= today]
         phase_start_dt = today
@@ -377,10 +460,15 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                 cum_m += grp['total_money']
                 start_calc = phase_start_dt if phase_start_dt == today else (phase_start_dt + timedelta(days=1))
                 cand_fixed_m = get_fixed_salary_payments(start_calc, grp['dt'], fixed_salary, fixed_start, fixed_day)
-                gap_m = max(0.0, cum_m - (phase_start_cash + cand_fixed_m))
+                cand_fixed_exp = get_fixed_expense_payments(start_calc, grp['dt'], fixed_expenses)
+                gap_m = max(0.0, (cum_m + cand_fixed_exp) - (phase_start_cash + cand_fixed_m))
                 gap_h = (gap_m / rate) if rate > 0 else 0.0
-                w = calculate_workdays(start_calc, grp['dt'], off_date_set, extra_work_dates=extra_work_set)
-                req = (gap_h / w) if w > 0 else 0.0
+                w = calculate_workdays(start_calc, grp['dt'], work_date_set)
+                if w > 0:
+                    req = gap_h / w
+                else:
+                    req = 999.0 if gap_h > 0 else 0.0
+
                 if req > best_pace or idx == 0:
                     best_pace = max(best_pace, req)
                     best_idx = idx
@@ -388,14 +476,11 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
             bottleneck_d = remaining_dates[best_idx]
             phase_dates = remaining_dates[:best_idx + 1]
             start_calc = phase_start_dt if phase_start_dt == today else (phase_start_dt + timedelta(days=1))
-            phase_w = calculate_workdays(start_calc, date_groups[bottleneck_d]["dt"], off_date_set, extra_work_dates=extra_work_set)
+            phase_w = calculate_workdays(start_calc, date_groups[bottleneck_d]["dt"], work_date_set)
             phase_fixed_m = get_fixed_salary_payments(start_calc, date_groups[bottleneck_d]["dt"], fixed_salary, fixed_start, fixed_day)
+            phase_fixed_exp = get_fixed_expense_payments(start_calc, date_groups[bottleneck_d]["dt"], fixed_expenses)
 
-            # 当有固定月薪且固定收入全额抵扣时，工时为 0.0h/天；未配置固定月薪时维持 5.0h/天的最低防懈怠基准
-            if fixed_salary > 0:
-                chosen_pace = best_pace
-            else:
-                chosen_pace = max(MIN_DAILY_FLOOR, best_pace) if best_pace > 0 else 0.0
+            chosen_pace = best_pace
 
             phases.append({
                 "bottleneck": bottleneck_d,
@@ -404,30 +489,44 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                 "dates": phase_dates,
                 "start_dt": phase_start_dt,
                 "workdays": phase_w,
-                "fixed_income": phase_fixed_m
+                "fixed_income": phase_fixed_m,
+                "fixed_expense": phase_fixed_exp
             })
 
             for d_str in phase_dates:
                 date_pace_map[d_str] = chosen_pace
 
-            total_earned = phase_w * chosen_pace * rate + phase_fixed_m
-            total_due = sum(date_groups[d]["total_money"] for d in phase_dates)
+            if phase_w > 0 and chosen_pace <= 10.0:
+                total_earned_freelance = phase_w * chosen_pace * rate
+            elif phase_w > 0 and chosen_pace > 10.0:
+                total_earned_freelance = phase_w * 10.0 * rate
+            else:
+                total_earned_freelance = 0.0
+
+            total_earned = total_earned_freelance + phase_fixed_m
+            total_due = sum(date_groups[d]["total_money"] for d in phase_dates) + phase_fixed_exp
             if not phases[1:]:
                 total_due += initial_uncovered_overdue
             phase_start_cash = max(0.0, phase_start_cash + total_earned - total_due)
             phase_start_dt = date_groups[bottleneck_d]["dt"]
             remaining_dates = remaining_dates[best_idx + 1:]
 
-        # 合并相邻相同工时（例如全额覆盖 0.0h/天）的阶段，保持宏观排班规划整洁
+        # 合并相邻相同状态（例如全额覆盖 0.0h/天，或连续超过10h天数不足）的阶段，保持宏观排班规划整洁
         merged_phases = []
         for p in phases:
-            if merged_phases and round(merged_phases[-1]["pace"], 1) == round(p["pace"], 1) and (round(p["pace"], 1) == 0.0):
+            is_prev_zero = merged_phases and round(merged_phases[-1]["pace"], 1) == 0.0
+            is_curr_zero = round(p["pace"], 1) == 0.0
+            is_prev_over = merged_phases and merged_phases[-1]["pace"] > 10.0
+            is_curr_over = p["pace"] > 10.0
+
+            if (is_prev_zero and is_curr_zero) or (is_prev_over and is_curr_over):
                 prev = merged_phases[-1]
                 prev["bottleneck"] = p["bottleneck"]
                 prev["dates"].extend(p["dates"])
                 s_calc = prev["start_dt"] if prev["start_dt"] == today else (prev["start_dt"] + timedelta(days=1))
-                prev["workdays"] = calculate_workdays(s_calc, date_groups[p["bottleneck"]]["dt"], off_date_set, extra_work_dates=extra_work_set)
+                prev["workdays"] = calculate_workdays(s_calc, date_groups[p["bottleneck"]]["dt"], work_date_set)
                 prev["fixed_income"] += p.get("fixed_income", 0.0)
+                prev["fixed_expense"] += p.get("fixed_expense", 0.0)
             else:
                 merged_phases.append(dict(p))
 
@@ -444,32 +543,39 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                 if d_dt < today:
                     continue
                 start_calc = (prev_d + timedelta(days=1)) if prev_d != today else prev_d
-                int_workdays = calculate_workdays(start_calc, d_dt, off_date_set, include_weekends=False, extra_work_dates=extra_work_set)
+                int_workdays = calculate_workdays(start_calc, d_dt, work_date_set)
                 
                 grp_names = " + ".join(grp["titles"])
                 prev_name = "今天" if prev_d == today else prev_d.strftime("%m-%d")
                 curr_name = d_dt.strftime("%m-%d")
 
-                pace_hours = date_pace_map.get(d_str, MIN_DAILY_FLOOR if fixed_salary <= 0 else 0.0)
-                earned_in_interval = int_workdays * pace_hours * rate
+                pace_hours = date_pace_map.get(d_str, 0.0)
+                eff_pace = min(pace_hours, 10.0) if pace_hours > 0 else 0.0
+                earned_in_interval = int_workdays * eff_pace * rate
                 int_fixed_m = get_fixed_salary_payments(start_calc, d_dt, fixed_salary, fixed_start, fixed_day)
+                int_fixed_exp = get_fixed_expense_payments(start_calc, d_dt, fixed_expenses)
                 avail_money = cur_cash + earned_in_interval + int_fixed_m
-                due_money = grp["total_money"]
+                due_money = grp["total_money"] + int_fixed_exp
                 surplus = avail_money - due_money
                 cur_cash = max(0.0, surplus)
 
-                fixed_note = f" (含固定工资 +€{int_fixed_m:.0f})" if int_fixed_m > 0 else ""
-                surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else "，全额达成"
+                notes = []
+                if int_fixed_m > 0:
+                    notes.append(f"固定工资+€{int_fixed_m:.0f}")
+                if int_fixed_exp > 0:
+                    notes.append(f"固定支出-€{int_fixed_exp:.0f}")
+                fixed_note = f" ({' | '.join(notes)})" if notes else ""
+                surplus_str = f"，达成后结余 `{fx.format_dual_currency(surplus, rates)}`" if surplus > 0.01 else ("，全额达成" if surplus >= -0.01 else f"，尚有缺口 `{fx.format_dual_currency(abs(surplus), rates)}`")
                 rounded_pace = round(pace_hours, 1)
 
                 if rounded_pace == 0.0:
-                    interval_lines.append(f"• 🟢全额覆盖 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `0.0h/天`{fixed_note}{surplus_str}")
-                elif rounded_pace > 8.0:
-                    interval_lines.append(f"• 🚨攻坚期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{fixed_note}{surplus_str}")
+                    interval_lines.append(f"• 🟢全额覆盖 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): 需 `0.0h/天`{fixed_note}{surplus_str}")
+                elif rounded_pace > 10.0:
+                    interval_lines.append(f"• ⚠️天数不足 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): 当前freelancer工作天数不够，建议在日历里面设置更多工作天数{fixed_note}{surplus_str}")
                 elif rounded_pace > 6.0:
-                    interval_lines.append(f"• 🔥冲刺期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{fixed_note}{surplus_str}")
+                    interval_lines.append(f"• 🔥冲刺期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{fixed_note}{surplus_str}")
                 else:
-                    interval_lines.append(f"• 🟢平稳期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}工作日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{fixed_note}{surplus_str}")
+                    interval_lines.append(f"• 🟢平稳期 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): 需 `{rounded_pace:.1f}h/天`{fixed_note}{surplus_str}")
                 prev_d = d_dt
             except Exception:
                 pass
@@ -487,19 +593,25 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                     short_titles += f" 等 {len(p_titles)} 个节点"
                 
                 p_rounded = round(p["pace"], 1)
-                fixed_note = f" (固定到账 +€{p['fixed_income']:.0f})" if p.get("fixed_income", 0.0) > 0 else ""
+                notes = []
+                if p.get("fixed_income", 0.0) > 0:
+                    notes.append(f"固定到账+€{p['fixed_income']:.0f}")
+                if p.get("fixed_expense", 0.0) > 0:
+                    notes.append(f"固定支出-€{p['fixed_expense']:.0f}")
+                fixed_note = f" ({' | '.join(notes)})" if notes else ""
+
                 if p_rounded == 0.0:
                     tag = f"🟢阶段{idx}·月薪全额覆盖"
-                    text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}工作日 | {short_titles}): 需 `0.0h/天`{fixed_note}\n"
-                elif p_rounded > 8.0:
-                    tag = f"🚨阶段{idx}·攻坚"
-                    text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}工作日 | {short_titles}): 需 `{p_rounded:.1f}h/天`{fixed_note}\n"
+                    text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): 需 `0.0h/天`{fixed_note}\n"
+                elif p_rounded > 10.0:
+                    tag = f"⚠️阶段{idx}·天数不足"
+                    text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): 当前freelancer工作天数不够，建议在日历里面设置更多工作天数{fixed_note}\n"
                 elif p_rounded > 6.0:
                     tag = f"🔥阶段{idx}·冲刺"
-                    text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}工作日 | {short_titles}): 需 `{p_rounded:.1f}h/天`{fixed_note}\n"
+                    text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): 需 `{p_rounded:.1f}h/天`{fixed_note}\n"
                 else:
                     tag = f"🟢阶段{idx}·平稳"
-                    text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}工作日 | {short_titles}): 需 `{p_rounded:.1f}h/天`{fixed_note}\n"
+                    text += f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): 需 `{p_rounded:.1f}h/天`{fixed_note}\n"
         else:
             text += "🔍 **【各节点逐项区间细分审计】**:\n"
             text += "\n".join(interval_lines) + "\n"
@@ -524,36 +636,14 @@ def get_main_keyboard(chat_id: int, show_all_milestones: bool = False, show_all_
             InlineKeyboardButton("💼 固定工作月薪", callback_data="set_fixed_salary"),
         ],
         [
+            InlineKeyboardButton("📉 固定支出管理", callback_data="manage_fixed_expenses"),
+            InlineKeyboardButton("📅 安排兼职工作日历", callback_data="manage_off_days"),
+        ],
+        [
             InlineKeyboardButton("➕ 添加阶段节点", callback_data="add_milestone"),
             InlineKeyboardButton("📋 管理/完成节点", callback_data="list_milestones"),
         ],
-        [
-            InlineKeyboardButton("🏖️ 请假与周末开工日历", callback_data="manage_off_days"),
-        ],
     ]
-
-    toggle_row = []
-    if has_more_ms:
-        if show_all_milestones:
-            toggle_row.append(InlineKeyboardButton("🔼 收起远期节点", callback_data=f"tg_v_0_{i_val}"))
-        else:
-            toggle_row.append(InlineKeyboardButton(f"🔍 展开待办节点({len(milestones)})", callback_data=f"tg_v_1_{i_val}"))
-
-    if show_all_intervals:
-        toggle_row.append(InlineKeyboardButton("🔼 收起细分账目", callback_data=f"tg_v_{m_val}_0"))
-    else:
-        toggle_row.append(InlineKeyboardButton("🔍 查看细分账目", callback_data=f"tg_v_{m_val}_1"))
-
-    if len(toggle_row) == 2:
-        keyboard.append(toggle_row)
-        keyboard.append([InlineKeyboardButton("🔄 刷新看板与汇率", callback_data="refresh")])
-    elif len(toggle_row) == 1:
-        toggle_row.append(InlineKeyboardButton("🔄 刷新看板与汇率", callback_data="refresh"))
-        keyboard.append(toggle_row)
-    else:
-        keyboard.append([InlineKeyboardButton("🔄 刷新看板与汇率", callback_data="refresh")])
-
-    return InlineKeyboardMarkup(keyboard)
 
     toggle_row = []
     if has_more_ms:
@@ -1012,19 +1102,69 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "🗑️ 已删除该阶段节点。\n\n" + format_overview(chat_id)
         await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id))
 
+    elif data == "manage_fixed_expenses" or data.startswith("del_fexp_"):
+        if data.startswith("del_fexp_"):
+            exp_id = int(data.replace("del_fexp_", ""))
+            del_title = db.delete_fixed_expense(exp_id, chat_id)
+            try:
+                await query.answer(f"🗑️ 已删除固定支出【{del_title}】", show_alert=False)
+            except Exception:
+                pass
+
+        expenses = db.get_fixed_expenses(chat_id)
+        rates = fx.get_exchange_rates()
+        keyboard = [
+            [InlineKeyboardButton("➕ 添加一项固定支出", callback_data="add_fixed_expense")]
+        ]
+        if not expenses:
+            msg_text = (
+                "📉 **【固定每月支出管理】**\n\n"
+                "当前暂未设置任何固定每月支出（如房租、生活费、学费、分期还款等）。\n\n"
+                "💡 设置后，系统会自动在每个月的对应日期扣减该支出（支持设置**到期结束月份**，到期后自动停止），无需再每个月手动新建重复的阶段节点！"
+            )
+        else:
+            total_m = sum(e["amount"] for e in expenses)
+            msg_text = (
+                f"📉 **【固定每月支出管理】** (共 {len(expenses)} 项 · 合计 `{fx.format_dual_currency(total_m, rates)} /月`)\n\n"
+                "当前生效中的固定支出如下（点击下方按钮可删除或新增）：\n\n"
+            )
+            for idx, e in enumerate(expenses, 1):
+                e_dual = fx.format_dual_currency(e["amount"], rates)
+                end_desc = f"至 `{e['end_date'][:7]}` 结束" if e.get("end_date") else "长期有效"
+                msg_text += f"{idx}. **{e['title']}**: `{e_dual}/月` (每月 `{e['pay_day']}` 日 | {end_desc})\n"
+                keyboard.append([
+                    InlineKeyboardButton(f"🗑️ 删除: {e['title']} (€{e['amount']:.0f}/月)", callback_data=f"del_fexp_{e['id']}")
+                ])
+
+        keyboard.append([InlineKeyboardButton("🔙 返回财务看板", callback_data="refresh")])
+        await safe_edit_message(query, msg_text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "add_fixed_expense":
+        user_states[chat_id] = {"action": "add_fixed_expense_input"}
+        prompt = (
+            "➕ **添加固定每月支出（支持设置结束期限）**\n\n"
+            "✍️ 请直接回复输入 **名称**、**金额**、**每月几号** 及 **到期月份（可选）**：\n\n"
+            "💡 示例：\n"
+            "• `房租 1000欧 每月1号`（长期固定支出）\n"
+            "• `生活费 600欧 每月30号`（长期固定支出）\n"
+            "• `学费 650欧 每月30号 到2027-02结束`（带期限，到期自动停扣）\n"
+            "• `分期还款 1086.79欧 每月6号 到2027-03结束`\n"
+            "• `健身房 500元`（默认每月1号、长期有效）"
+        )
+        await safe_edit_message(query, prompt, reply_markup=cancel_btn)
+
     elif data == "manage_off_days":
         today = get_today()
         cal_kb = build_calendar_keyboard(chat_id, today.year, today.month)
         text = (
-            "📅 **【工作日历与工时调度】**\n\n"
-            "直接点击日历中的日期即可切换工作/休息状态：\n"
-            "• **周一至周五**：点击设为 🏖️ 请假休息（扣除可用天数）\n"
-            "• **周六周日**：点击设为 💼 周末加班开工（**增加可用工时，减轻每日压力**）\n\n"
+            "📅 **【Freelancer 兼职日历与排班】**\n\n"
+            "您现在有全职工作，日历采用**主动点选**逻辑：\n"
+            "• **点击任意一天**：直接设为 💼 **兼职开工日**（按照工作来算）\n"
+            "• **再次点击**：取消该天的兼职安排\n\n"
             "图标说明：\n"
-            "• 🏖️ = 请假/休息日（已排除）\n"
-            "• 💼 = 周末加班开工日（已加入可用工作日）\n"
-            "• 💤 = 常规周末休息（默认排除）\n"
-            "• 📍 = 今天\n\n"
+            "• 💼 = 兼职开工日（计入 Freelancer 可用工作天数）\n"
+            "• 📍 = 今天\n"
+            "• 普通数字 = 无兼职安排（专注全职/休息）\n\n"
             "设置后点击底部【🔙 返回财务看板】，每日工时将立即自动重测！"
         )
         await safe_edit_message(query, text=text, reply_markup=cal_kb)
@@ -1034,15 +1174,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nav_year, nav_month = int(parts[2]), int(parts[3])
         cal_kb = build_calendar_keyboard(chat_id, nav_year, nav_month)
         text = (
-            "📅 **【工作日历与工时调度】**\n\n"
-            "直接点击日历中的日期即可切换工作/休息状态：\n"
-            "• **周一至周五**：点击设为 🏖️ 请假休息（扣除可用天数）\n"
-            "• **周六周日**：点击设为 💼 周末加班开工（**增加可用工时，减轻每日压力**）\n\n"
+            "📅 **【Freelancer 兼职日历与排班】**\n\n"
+            "您现在有全职工作，日历采用**主动点选**逻辑：\n"
+            "• **点击任意一天**：直接设为 💼 **兼职开工日**（按照工作来算）\n"
+            "• **再次点击**：取消该天的兼职安排\n\n"
             "图标说明：\n"
-            "• 🏖️ = 请假/休息日（已排除）\n"
-            "• 💼 = 周末加班开工日（已加入可用工作日）\n"
-            "• 💤 = 常规周末休息（默认排除）\n"
-            "• 📍 = 今天\n\n"
+            "• 💼 = 兼职开工日（计入 Freelancer 可用工作天数）\n"
+            "• 📍 = 今天\n"
+            "• 普通数字 = 无兼职安排（专注全职/休息）\n\n"
             "设置后点击底部【🔙 返回财务看板】，每日工时将立即自动重测！"
         )
         await safe_edit_message(query, text=text, reply_markup=cal_kb)
@@ -1051,29 +1190,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split("_")
         toggle_date_str = parts[2]
         cur_year, cur_month = int(parts[3]), int(parts[4])
-        toggle_dt = parse_date_safely(toggle_date_str)
-        is_weekend = (toggle_dt.weekday() >= 5)
 
-        if is_weekend:
-            # 周末：点击切换 默认休息(💤) <-> 特别开工工作日(💼)
-            work_days = db.get_work_days(chat_id)
-            existing_work = next((wd for wd in work_days if wd["work_date"] == toggle_date_str), None)
-            if existing_work:
-                db.delete_work_day(chat_id, toggle_date_str)
-                action_tip = f"已将 {toggle_date_str} (周末) 恢复为常规休息 💤"
-            else:
-                db.add_work_day(chat_id, toggle_date_str, "周末加班开工")
-                action_tip = f"✅ 已将 {toggle_date_str} (周末) 设为加班工作日 💼！可用天数+1"
+        # 主动点选逻辑：点击哪一天，哪一天就切换为 Freelancer 兼职工作日 (💼)
+        work_days = db.get_work_days(chat_id)
+        existing_work = next((wd for wd in work_days if wd["work_date"] == toggle_date_str), None)
+        if existing_work:
+            db.delete_work_day(chat_id, toggle_date_str)
+            action_tip = f"已取消 {toggle_date_str} 的兼职工作安排"
         else:
-            # 周一至周五工作日：点击切换 正常工作日 <-> 请假休息(🏖️)
-            off_days = db.get_off_days(chat_id)
-            existing_off = next((od for od in off_days if od["off_date"] == toggle_date_str), None)
-            if existing_off:
-                db.delete_off_day(existing_off["id"], chat_id)
-                action_tip = f"✅ 已取消 {toggle_date_str} 的请假，恢复为工作日"
-            else:
-                db.add_off_day(chat_id, toggle_date_str, "日历点选")
-                action_tip = f"已将 {toggle_date_str} 设为请假休息 🏖️"
+            db.add_work_day(chat_id, toggle_date_str, "日历点选兼职")
+            action_tip = f"✅ 已将 {toggle_date_str} 设为兼职工作日 💼！可用天数+1"
 
         try:
             await query.answer(action_tip, show_alert=False)
@@ -1083,15 +1209,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 刷新当前月份日历
         cal_kb = build_calendar_keyboard(chat_id, cur_year, cur_month)
         text = (
-            "📅 **【工作日历与工时调度】**\n\n"
-            "直接点击日历中的日期即可切换工作/休息状态：\n"
-            "• **周一至周五**：点击设为 🏖️ 请假休息（扣除可用天数）\n"
-            "• **周六周日**：点击设为 💼 周末加班开工（**增加可用工时，减轻每日压力**）\n\n"
+            "📅 **【Freelancer 兼职日历与排班】**\n\n"
+            "您现在有全职工作，日历采用**主动点选**逻辑：\n"
+            "• **点击任意一天**：直接设为 💼 **兼职开工日**（按照工作来算）\n"
+            "• **再次点击**：取消该天的兼职安排\n\n"
             "图标说明：\n"
-            "• 🏖️ = 请假/休息日（已排除）\n"
-            "• 💼 = 周末加班开工日（已加入可用工作日）\n"
-            "• 💤 = 常规周末休息（默认排除）\n"
-            "• 📍 = 今天\n\n"
+            "• 💼 = 兼职开工日（计入 Freelancer 可用工作天数）\n"
+            "• 📍 = 今天\n"
+            "• 普通数字 = 无兼职安排（专注全职/休息）\n\n"
             "设置后点击底部【🔙 返回财务看板】，每日工时将立即自动重测！"
         )
         await safe_edit_message(query, text=text, reply_markup=cal_kb)
@@ -1107,9 +1232,10 @@ def parse_direct_command(text: str, chat_id: int) -> tuple[bool, str]:
     - 支出：-50, -50欧, 支出 100, 花了 200元
     - 总资金：资金 5000, 总资金 6500, 余额 50000元, 存款 3000
     - 时薪：时薪 20, 时薪 25刀, 时薪 $20
+    - 固定支出：固定支出 房租 1000欧 每月1号 / 固定支出 学费 650欧 30号 到2027-02结束
     - 完成节点：完成 健身年卡, 搞定 兼职项目
     - 添加节点：租房 800欧 2026-11-01
-    - 请假/加班：请假 2026-10-25 / 加班 2026-10-18
+    - 兼职排班：兼职 2026-11-25 / 开工 11-25 / 休息 11-25
     """
     rates = fx.get_exchange_rates()
     t = text.strip()
@@ -1184,6 +1310,32 @@ def parse_direct_command(text: str, chat_id: int) -> tuple[bool, str]:
         title, deducted = db.complete_milestone(target["id"], chat_id)
         return True, f"🎉 恭喜！节点【**{title}**】已标记完成！\n💰 已按计划自动从总资金扣除 `{fx.format_dual_currency(deducted, rates)}`。"
 
+    # 5b. 删除固定支出: 删除固定支出 房租
+    m_del_fexp = re.match(r"^(?:删除|取消|移除)(?:固定支出|固定开销)\s+(.+)$", t)
+    if m_del_fexp:
+        kw = m_del_fexp.group(1).strip()
+        exps = db.get_fixed_expenses(chat_id)
+        matched = [e for e in exps if kw.lower() in e["title"].lower() or e["title"].lower() in kw.lower()]
+        if not matched:
+            return True, f"⚠️ 未找到包含【{kw}】的固定支出项。"
+        target = matched[0]
+        del_title = db.delete_fixed_expense(target["id"], chat_id)
+        return True, f"🗑️ 已成功删除固定支出【**{del_title}**】！"
+
+    # 5c. 添加固定支出: 固定支出 房租 1000欧 每月1号 / 固定支出 学费 650欧 30号 到2027-02结束
+    if re.match(r"^(?:添加|新增|设置)?(?:固定支出|固定开销|每月支出)\s+", t):
+        parsed_exp = parse_fixed_expense_input(t, rates)
+        if parsed_exp:
+            title, val_eur, pay_day, start_date, end_date = parsed_exp
+            db.add_fixed_expense(chat_id, title, val_eur, pay_day, start_date, end_date)
+            val_dual = fx.format_dual_currency(val_eur, rates)
+            end_desc = f"至 `{end_date[:7]}` 结束" if end_date else "长期有效"
+            return True, (
+                f"✅ **成功添加固定每月支出**！【**{title}**】\n"
+                f"💸 每月金额: `{val_dual}` (每月 `{pay_day}` 日扣减)\n"
+                f"📅 期限设置: {end_desc}"
+            )
+
     # 6. 新增带截止日期的节点: 租房 800欧 2026-11-01 或 租房 800欧 11-01
     parts = t.split()
     if len(parts) == 3:
@@ -1208,19 +1360,19 @@ def parse_direct_command(text: str, chat_id: int) -> tuple[bool, str]:
         except Exception:
             pass
 
-    # 7. 请假或周末开工: 请假 2026-10-25 / 加班 2026-10-18 / 请假 10-25
-    m_cal = re.match(r"^(请假|休息|加班|开工)\s+(.+)$", t)
+    # 7. 兼职工作日排班或取消: 兼职 2026-11-25 / 开工 11-25 / 加班 11-25 / 休息 11-25 / 请假 11-25
+    m_cal = re.match(r"^(兼职|开工|加班|请假|休息|取消兼职)\s+(.+)$", t)
     if m_cal:
         action_type, d_str = m_cal.group(1), m_cal.group(2).strip()
         parsed_cal = parse_date_safely(d_str)
         if parsed_cal != date.max:
             clean_cal = parsed_cal.strftime("%Y-%m-%d")
-            if action_type in ["请假", "休息"]:
-                db.add_off_day(chat_id, clean_cal, "文字记录")
-                return True, f"🏖️ 已将 `{clean_cal}` 设为请假休息日！"
+            if action_type in ["请假", "休息", "取消兼职"]:
+                db.delete_work_day(chat_id, clean_cal)
+                return True, f"🏖️ 已取消 `{clean_cal}` 的兼职工作安排！"
             else:
                 db.add_work_day(chat_id, clean_cal, "文字记录")
-                return True, f"💼 已将 `{clean_cal}` 设为周末加班开工日！"
+                return True, f"💼 已将 `{clean_cal}` 设为 Freelancer 兼职工作日！"
 
     # 8. 修改节点金额: 改金额 学费 800欧 / 修改金额 还爸妈钱 1500元 / 学费 改为 800欧
     m_mod = re.match(r"^(?:改金额|修改金额|调整金额|改钱)\s+(.+)\s+(.+)$", t)
@@ -1308,10 +1460,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• **更新总资金**：发送 `资金 5000` 或 `总资金 50000元`\n"
             "• **更新Freelancer时薪**：发送 `时薪 20` 或 `时薪 25刀`\n"
             "• **设置固定工作月薪**：发送 `从12月开始我的固定收入是2600欧` 或 `固定月薪 2600`\n"
+            "• **添加固定每月支出**：发送 `固定支出 房租 1000欧 每月1号` 或 `固定支出 学费 650欧 30号 到2027-02结束`\n"
             "• **修改节点金额**：发送 `改金额 学费 800欧` 或 `学费 改为 5000元`\n"
             "• **完成节点**：发送 `完成 健身卡` 或 `搞定 兼职项目`\n"
             "• **添加节点**：发送 `买电脑 1200欧 12-01` 或 `租房 800欧 2026-11-01`\n"
-            "• **请假/加班**：发送 `请假 10-25` 或 `加班 10-18`\n\n"
+            "• **安排兼职日**：发送 `兼职 11-25` 或 `休息 11-25`\n\n"
             "📦 **云端数据与备份**：\n"
             "• `/seed` 或 `/export`：生成 Render 永久环境变量 `SEED_DATA`\n"
             "• `/backup`：一键导出本地数据库 `.db` 文件\n\n"
@@ -1377,6 +1530,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💼 **每月税后到账**: `{val_dual}`\n"
             f"📅 **首次生效**: `{fixed_start}` 起 (每月 `{fixed_day}` 日到账)\n\n"
             f"系统已重新测算：固定工资先冲抵未来阶段目标，剩余缺口由 Freelancer 工时补齐！\n\n"
+        ) + format_overview(chat_id)
+        await update.message.reply_text(res_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
+
+    elif action == "add_fixed_expense_input":
+        parsed = parse_fixed_expense_input(text, rates)
+        if not parsed:
+            await update.message.reply_text(
+                "❌ 未能识别有效名称和金额，请重新输入！\n"
+                "例如：`房租 1000欧 每月1号` 或 `学费 650欧 每月30号 到2027-02结束`"
+            )
+            return
+        title, val_eur, pay_day, start_date, end_date = parsed
+        db.add_fixed_expense(chat_id, title, val_eur, pay_day, start_date, end_date)
+        user_states.pop(chat_id, None)
+
+        val_dual = fx.format_dual_currency(val_eur, rates)
+        end_desc = f"至 `{end_date[:7]}` 结束（到期自动停扣）" if end_date else "长期有效"
+        res_text = (
+            f"🎉 **固定每月支出添加成功！**\n\n"
+            f"📌 **支出项目**: 【**{title}**】\n"
+            f"💸 **每月金额**: `{val_dual}` (每月 `{pay_day}` 日自动计入)\n"
+            f"📅 **有效期**: {end_desc}\n\n"
         ) + format_overview(chat_id)
         await update.message.reply_text(res_text, reply_markup=get_main_keyboard(chat_id), parse_mode="Markdown")
             

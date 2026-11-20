@@ -27,13 +27,20 @@ def generate_seed() -> str:
     c.execute("SELECT id, chat_id, work_date, note, created_at FROM extra_work_days")
     extra_work_days = [dict(r) for r in c.fetchall()]
 
+    try:
+        c.execute("SELECT id, chat_id, title, amount, pay_day, start_date, end_date, created_at FROM fixed_expenses")
+        fixed_expenses = [dict(r) for r in c.fetchall()]
+    except Exception:
+        fixed_expenses = []
+
     conn.close()
 
     data = {
         "user_profile": user_profile,
         "milestones": milestones,
         "off_days": off_days,
-        "extra_work_days": extra_work_days
+        "extra_work_days": extra_work_days,
+        "fixed_expenses": fixed_expenses
     }
 
     dumped = json.dumps(data, ensure_ascii=False)
