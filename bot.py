@@ -559,6 +559,64 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
 
         sorted_dates = sorted(date_groups.keys(), key=lambda d: parse_date_safely(d))
         overdue_money = sum(date_groups[d]["total_money"] for d in sorted_dates if parse_date_safely(d) < today)
+        remaining_dates = [d for d in sorted_dates if parse_date_safely(d) >= today]
+
+        # 核心算法：向后前瞻的多阶段动态平滑排班（Forward-Looking Piecewise Bottleneck Smoothing）
+        # 自动将后续紧迫节点的工时需求向前序可用兼职日平摊预存（最高拉满至 10.0h/天），避免前松后紧
+        phase_start_dt = today
+        phase_start_cash = max(0.0, balance - overdue_money)
+        initial_uncovered_overdue = max(0.0, overdue_money - balance)
+        date_pace_map = {}
+        first_phase = True
+
+        while remaining_dates:
+            best_pace = 0.0
+            best_idx = 0
+            cum_m = initial_uncovered_overdue if first_phase else 0.0
+            start_calc = phase_start_dt if phase_start_dt == today else (phase_start_dt + timedelta(days=1))
+
+            for idx, d_str in enumerate(remaining_dates):
+                grp = date_groups[d_str]
+                cum_m += grp["total_money"]
+                cand_fixed_m = get_fixed_salary_payments(start_calc, grp["dt"], fixed_salary, fixed_start, fixed_day)
+                gap_m = max(0.0, cum_m - (phase_start_cash + cand_fixed_m))
+                gap_h = (gap_m / rate) if rate > 0 else 0.0
+                w = calculate_workdays(start_calc, grp["dt"], work_date_set)
+                if gap_h <= 0:
+                    req = 0.0
+                elif w > 0:
+                    req = gap_h / w
+                else:
+                    req = 999.0
+
+                if req > 10.0:
+                    # 达到 10h/天 上限：将此前所有可用兼职日拉满至 10h/天 提前预存，并在该节点截断
+                    best_pace = req
+                    best_idx = idx
+                    break
+
+                if req >= best_pace or idx == 0:
+                    best_pace = req
+                    best_idx = idx
+
+            bottleneck_d = remaining_dates[best_idx]
+            phase_dates = remaining_dates[:best_idx + 1]
+            phase_w = calculate_workdays(start_calc, date_groups[bottleneck_d]["dt"], work_date_set)
+            phase_fixed_m = get_fixed_salary_payments(start_calc, date_groups[bottleneck_d]["dt"], fixed_salary, fixed_start, fixed_day)
+            total_due = sum(date_groups[d]["total_money"] for d in phase_dates)
+            if first_phase:
+                total_due += initial_uncovered_overdue
+                first_phase = False
+
+            eff_pace = min(best_pace, 10.0) if best_pace > 0 else 0.0
+            total_earned = phase_w * eff_pace * rate + phase_fixed_m
+
+            for d_str in phase_dates:
+                date_pace_map[d_str] = best_pace
+
+            phase_start_cash = max(0.0, phase_start_cash + total_earned - total_due)
+            phase_start_dt = date_groups[bottleneck_d]["dt"]
+            remaining_dates = remaining_dates[best_idx + 1:]
 
         text += "─────────────────\n"
 
@@ -579,44 +637,50 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
 
             due_money = grp["total_money"] + carry_overdue
             carry_overdue = 0.0
-            avail_base = cur_cash + int_fixed_m
-            gap_money = max(0.0, due_money - avail_base)
-            req_hours = (gap_money / rate) if rate > 0 else 0.0
-            cur_cash = max(0.0, avail_base - due_money)
+
+            raw_pace = date_pace_map.get(d_str, 0.0)
+            eff_pace = min(raw_pace, 10.0) if raw_pace > 0 else 0.0
+            work_h = int_workdays * eff_pace
+            earned_m = work_h * rate
+
+            avail_before_work = cur_cash + int_fixed_m
+            avail_after_work = avail_before_work + earned_m
+            surplus = avail_after_work - due_money
+            shortfall_m = max(0.0, -surplus)
+            shortfall_h = (shortfall_m / rate) if rate > 0 else 0.0
+            cur_cash = max(0.0, surplus)
 
             grp_names = " + ".join(grp["titles"])
             prev_name = "今天" if prev_d == today else prev_d.strftime("%m-%d")
             curr_name = d_dt.strftime("%m-%d")
             fixed_note = f" (固定工资+€{int_fixed_m:.0f})" if int_fixed_m > 0 else ""
+            surplus_note = f"，预存结余 `€{cur_cash:.2f}`" if cur_cash > 0.01 else ""
 
-            if gap_money <= 0.01:
+            if shortfall_m > 0.01:
+                status = "over"
+                if work_h > 0.05:
+                    interval_lines.append(
+                        f"• ⚠️天数不足 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): "
+                        f"需 `€{due_money:.2f}` | 差 `€{shortfall_m:.2f}` | 已排 `{work_h:.1f}h`，天数不够，还需 `{shortfall_h:.1f}h`{fixed_note}"
+                    )
+                else:
+                    interval_lines.append(
+                        f"• ⚠️天数不足 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): "
+                        f"需 `€{due_money:.2f}` | 差 `€{shortfall_m:.2f}` | 天数不够，还需 `{shortfall_h:.1f}h`{fixed_note}"
+                    )
+            elif work_h <= 0.05:
                 status = "zero"
-                surplus_note = f"，结余 `€{cur_cash:.2f}`" if cur_cash > 0.01 else ""
                 interval_lines.append(
                     f"• 🟢全额覆盖 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): "
                     f"需 `€{due_money:.2f}` | 差 `€0.00` | 需工作 `0.0h`{fixed_note}{surplus_note}"
                 )
-            elif int_workdays > 0 and (req_hours / int_workdays) <= 10.0:
+            else:
                 status = "ok"
-                daily_h = req_hours / int_workdays
-                tag = "🔥冲刺期" if daily_h > 6.0 else "🟢平稳期"
+                tag = "🔥冲刺期" if eff_pace > 6.0 else "🟢平稳期"
                 interval_lines.append(
                     f"• {tag} `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): "
-                    f"需 `€{due_money:.2f}` | 差 `€{gap_money:.2f}` | 需工作 `{req_hours:.1f}h` (`{daily_h:.1f}h/天`){fixed_note}"
+                    f"需 `€{due_money:.2f}` | 差 `€0.00` | 需工作 `{work_h:.1f}h` (`{eff_pace:.1f}h/天`){fixed_note}{surplus_note}"
                 )
-            else:
-                status = "over"
-                still_h = max(0.0, req_hours - int_workdays * 10.0)
-                if int_workdays > 0:
-                    interval_lines.append(
-                        f"• ⚠️天数不足 `[{prev_name} ➔ {curr_name}]` ({int_workdays}兼职日 | {grp_names}): "
-                        f"需 `€{due_money:.2f}` | 差 `€{gap_money:.2f}` | 需工作 `{req_hours:.1f}h` (天数不够，还需 `{still_h:.1f}h`){fixed_note}"
-                    )
-                else:
-                    interval_lines.append(
-                        f"• ⚠️天数不足 `[{prev_name} ➔ {curr_name}]` (0兼职日 | {grp_names}): "
-                        f"需 `€{due_money:.2f}` | 差 `€{gap_money:.2f}` | 需工作 `{req_hours:.1f}h` (天数不够，还需 `{still_h:.1f}h`){fixed_note}"
-                    )
 
             intervals.append({
                 "start_dt": prev_d,
@@ -624,8 +688,9 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                 "workdays": int_workdays,
                 "titles": list(grp["titles"]),
                 "due_money": due_money,
-                "gap_money": gap_money,
-                "req_hours": req_hours,
+                "work_h": work_h,
+                "shortfall_m": shortfall_m,
+                "shortfall_h": shortfall_h,
                 "fixed_income": int_fixed_m,
                 "end_cash": cur_cash,
                 "status": status
@@ -634,14 +699,18 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
 
         merged_phases = []
         for inv in intervals:
-            if merged_phases and merged_phases[-1]["status"] == inv["status"]:
+            if merged_phases and (
+                merged_phases[-1]["status"] == inv["status"]
+                or (merged_phases[-1]["status"] == "ok" and inv["status"] == "zero" and inv["fixed_income"] == 0)
+            ):
                 prev = merged_phases[-1]
                 prev["end_dt"] = inv["end_dt"]
                 prev["workdays"] += inv["workdays"]
                 prev["titles"].extend(inv["titles"])
                 prev["due_money"] += inv["due_money"]
-                prev["gap_money"] += inv["gap_money"]
-                prev["req_hours"] += inv["req_hours"]
+                prev["work_h"] += inv["work_h"]
+                prev["shortfall_m"] += inv["shortfall_m"]
+                prev["shortfall_h"] += inv["shortfall_h"]
                 prev["fixed_income"] += inv["fixed_income"]
                 prev["end_cash"] = inv["end_cash"]
             else:
@@ -656,27 +725,33 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                 if len(p["titles"]) > 2:
                     short_titles += f" 等 {len(p['titles'])} 项"
                 fixed_note = f" (固定工资+€{p['fixed_income']:.0f})" if p.get("fixed_income", 0.0) > 0 else ""
+                surplus_note = f"，预存结余 `€{p['end_cash']:.2f}`" if p.get("end_cash", 0.0) > 0.01 else ""
 
                 if p["status"] == "zero":
-                    tag = f"🟢阶段{idx}·月薪全额覆盖"
+                    tag = f"🟢阶段{idx}·全额覆盖"
                     text += (
                         f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): "
-                        f"需 `€{p['due_money']:.2f}` | 差 `€0.00` | 需工作 `0.0h`{fixed_note}\n"
+                        f"需 `€{p['due_money']:.2f}` | 差 `€0.00` | 需工作 `0.0h`{fixed_note}{surplus_note}\n"
                     )
                 elif p["status"] == "ok":
-                    daily_h = p["req_hours"] / p["workdays"]
+                    daily_h = (p["work_h"] / p["workdays"]) if p["workdays"] > 0 else 0.0
                     tag = f"🔥阶段{idx}·冲刺" if daily_h > 6.0 else f"🟢阶段{idx}·平稳"
                     text += (
                         f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): "
-                        f"需 `€{p['due_money']:.2f}` | 差 `€{p['gap_money']:.2f}` | 需工作 `{p['req_hours']:.1f}h` (`{daily_h:.1f}h/天`){fixed_note}\n"
+                        f"需 `€{p['due_money']:.2f}` | 差 `€0.00` | 需工作 `{p['work_h']:.1f}h` (`{daily_h:.1f}h/天`){fixed_note}{surplus_note}\n"
                     )
                 else:
                     tag = f"⚠️阶段{idx}·天数不足"
-                    still_h = max(0.0, p["req_hours"] - p["workdays"] * 10.0)
-                    text += (
-                        f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): "
-                        f"需 `€{p['due_money']:.2f}` | 差 `€{p['gap_money']:.2f}` | 需工作 `{p['req_hours']:.1f}h` (天数不够，还需 `{still_h:.1f}h`){fixed_note}\n"
-                    )
+                    if p["work_h"] > 0.05:
+                        text += (
+                            f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): "
+                            f"需 `€{p['due_money']:.2f}` | 差 `€{p['shortfall_m']:.2f}` | 已排 `{p['work_h']:.1f}h`，天数不够，还需 `{p['shortfall_h']:.1f}h`{fixed_note}\n"
+                        )
+                    else:
+                        text += (
+                            f"• **{tag}** `[{s_name} ➔ {e_name}]` ({p['workdays']}兼职日 | {short_titles}): "
+                            f"需 `€{p['due_money']:.2f}` | 差 `€{p['shortfall_m']:.2f}` | 天数不够，还需 `{p['shortfall_h']:.1f}h`{fixed_note}\n"
+                        )
         else:
             text += "🔍 **【各节点逐项区间细分审计】**:\n"
             text += "\n".join(interval_lines) + "\n"
