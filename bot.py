@@ -509,8 +509,11 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
         user_work_days = db.get_work_days(chat_id)
         work_date_set = {wd["work_date"] for wd in user_work_days}
 
-        # 确定推算时间终点：覆盖到最远阶段节点所在月份的月底（若无阶段节点，默认覆盖到下个月底）
-        max_ms_dt = today + timedelta(days=35)
+        # 确定推算时间终点：至少计算未来一整年（12个月）的月数，若最远阶段节点超过一年则覆盖到最远节点所在月底
+        y_1yr = today.year + 1
+        m_1yr = today.month
+        _, last_d_1yr = calendar.monthrange(y_1yr, m_1yr)
+        max_ms_dt = date(y_1yr, m_1yr, last_d_1yr)
         for m in milestones:
             d_obj = parse_date_safely(m['target_date'])
             if d_obj != date.max and d_obj > max_ms_dt:
@@ -716,8 +719,13 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
             else:
                 merged_phases.append(dict(inv))
 
-        if not show_all_intervals:
-            text += "🧭 **【各阶段Freelancer工时规划】**:\n"
+        int_page = int(show_all_intervals) if show_all_intervals else 0
+        page_size = 18
+        total_int_pages = max(1, (len(interval_lines) + page_size - 1) // page_size)
+        user_states.setdefault(chat_id, {})["total_int_pages"] = total_int_pages
+
+        if int_page <= 0:
+            text += "🧭 **【各阶段Freelancer工时规划 (未来12个月)】**:\n"
             for idx, p in enumerate(merged_phases, 1):
                 s_name = "今天" if p["start_dt"] == today else p["start_dt"].strftime("%m-%d")
                 e_name = p["end_dt"].strftime("%m-%d")
@@ -753,18 +761,21 @@ def format_overview(chat_id: int, show_all_milestones: bool = False, show_all_in
                             f"需 `€{p['due_money']:.2f}` | 差 `€{p['shortfall_m']:.2f}` | 天数不够，还需 `{p['shortfall_h']:.1f}h`{fixed_note}\n"
                         )
         else:
-            text += "🔍 **【各节点逐项区间细分审计】**:\n"
-            text += "\n".join(interval_lines) + "\n"
+            int_page = max(1, min(int_page, total_int_pages))
+            paged_lines = interval_lines[(int_page - 1) * page_size : int_page * page_size]
+            text += f"🔍 **【各节点逐项区间细分审计 (共 {len(interval_lines)} 项 · 第 {int_page}/{total_int_pages} 页)】**:\n"
+            text += "\n".join(paged_lines) + "\n"
 
     text += "─────────────────\n请选择你要进行的操作："
     return text
 
-def get_main_keyboard(chat_id: int, show_all_milestones: bool = False, show_all_intervals: bool = False):
+def get_main_keyboard(chat_id: int, show_all_milestones: bool = False, show_all_intervals: int | bool = 0):
     milestones = db.get_milestones(chat_id, status="pending")
     has_more_ms = len(milestones) > 3
 
     m_val = 1 if show_all_milestones else 0
-    i_val = 1 if show_all_intervals else 0
+    i_val = int(show_all_intervals) if show_all_intervals else 0
+    total_int_pages = user_states.get(chat_id, {}).get("total_int_pages", 1)
 
     keyboard = [
         [
@@ -785,6 +796,15 @@ def get_main_keyboard(chat_id: int, show_all_milestones: bool = False, show_all_
         ],
     ]
 
+    if i_val > 0 and total_int_pages > 1:
+        nav_row = []
+        if i_val > 1:
+            nav_row.append(InlineKeyboardButton("◀️ 账目上一页", callback_data=f"tg_v_{m_val}_{i_val - 1}"))
+        nav_row.append(InlineKeyboardButton(f"📄 账目 {i_val}/{total_int_pages} 页", callback_data="cal_ignore"))
+        if i_val < total_int_pages:
+            nav_row.append(InlineKeyboardButton("账目下一页 ▶️", callback_data=f"tg_v_{m_val}_{i_val + 1}"))
+        keyboard.append(nav_row)
+
     toggle_row = []
     if has_more_ms:
         if show_all_milestones:
@@ -792,7 +812,7 @@ def get_main_keyboard(chat_id: int, show_all_milestones: bool = False, show_all_
         else:
             toggle_row.append(InlineKeyboardButton(f"🔍 展开待办节点({len(milestones)})", callback_data=f"tg_v_1_{i_val}"))
 
-    if show_all_intervals:
+    if i_val > 0:
         toggle_row.append(InlineKeyboardButton("🔼 收起细分账目", callback_data=f"tg_v_{m_val}_0"))
     else:
         toggle_row.append(InlineKeyboardButton("🔍 查看细分账目", callback_data=f"tg_v_{m_val}_1"))
@@ -972,7 +992,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         parts = data.split("_")
         show_m = (parts[2] == "1")
-        show_i = (parts[3] == "1")
+        show_i = int(parts[3]) if parts[3].isdigit() else 0
         text = format_overview(chat_id, show_all_milestones=show_m, show_all_intervals=show_i)
         await safe_edit_message(query, text=text, reply_markup=get_main_keyboard(chat_id, show_all_milestones=show_m, show_all_intervals=show_i))
 
